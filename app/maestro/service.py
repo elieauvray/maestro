@@ -11,10 +11,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.anthropic_client import ManagedAgentsError
-from app.maestro.knowledge import CONNECTOR_NAMES
+from app.maestro.bpmn import ImportResult
+from app.maestro.knowledge import CONNECTOR_KEYS, CONNECTOR_NAMES
 from app.deps import get_user_settings
 from app.models import RunStatus, Skill, User, Workflow, WorkflowRun, utcnow
 from app.plans.service import connector_policies
@@ -28,6 +30,7 @@ log = logging.getLogger(__name__)
 GENERATING_TIMEOUT = timedelta(minutes=20)
 ACTORS = ("maestro", "dispatch", "human", "upsun", "external")
 DONE_WHEN = {"pr_merged", "pr_approved", "issue_closed", "pr_opened"}
+MAX_STEP_ID = 40  # long enough to keep BPMN element ids as step ids
 
 
 # --- Design -------------------------------------------------------------------
@@ -42,6 +45,76 @@ def create_maestro_workflow(db: Session, user: User, name: str, description: str
     db.add(wf)
     db.commit()
     return wf
+
+
+# --- BPMN import ------------------------------------------------------------------------------
+
+
+def _unique_name(base: str, taken: set[str]) -> str:
+    base = (base.strip() or "Imported BPMN process")[:128]
+    name, n = base, 2
+    while name in taken:
+        suffix = f" ({n})"
+        name, n = base[: 128 - len(suffix)] + suffix, n + 1
+    return name
+
+
+def _restore_export(db: Session, wf: Workflow, result: ImportResult) -> None:
+    """An unchanged Maestro file: the stored design comes back as it was (no Anthropic call)."""
+    stored = dict(result.design or {})
+    prompt = str(stored.pop("orchestration_prompt", "") or "").strip()
+    connectors = [c for c in stored.get("connectors_needed") or [] if c in CONNECTOR_NAMES]
+    wf.design_json = {**_normalize_design(stored, stored), "connectors_needed": connectors}
+    wf.content = prompt
+    wf.clarifications = None
+    wf.design_status = "ready"
+    wf.design_error = None
+    wf.design_feedback = None
+    wf.design_progress = None
+    wf.instructions_hash = current_instructions_hash(db)
+    wf.design_updated_at = utcnow()
+
+
+def _queue_import(wf: Workflow, result: ImportResult) -> None:
+    """Any other file: the description and the findings are stored, the worker runs the review first."""
+    wf.design_json = None
+    wf.content = ""
+    wf.clarifications = {"kind": "import_pending", "findings": result.findings}
+    wf.design_status = "queued"
+    wf.design_error = None
+    wf.design_feedback = None
+    wf.design_progress = None
+
+
+def create_imported_workflow(db: Session, user: User, result: ImportResult, shared: bool = False) -> Workflow:
+    """A workflow from a BPMN file. Its name is the process name, made unique among the user's workflows."""
+    taken = set(db.scalars(select(Workflow.name).where(Workflow.user_id == user.id)))
+    for _ in range(20):
+        name = _unique_name(result.name, taken)
+        wf = Workflow(user_id=user.id, name=name, description=result.description or "Imported from a BPMN file.",
+                      content="", design_status="queued", shared=shared)
+        if result.kind == "maestro":
+            _restore_export(db, wf, result)
+        else:
+            _queue_import(wf, result)
+        db.add(wf)
+        try:
+            db.commit()
+            return wf
+        except IntegrityError:  # the same name was taken meanwhile
+            db.rollback()
+            taken.add(name)
+    raise ManagedAgentsError("Could not find a free name for this project.")
+
+
+def reimport_workflow(db: Session, wf: Workflow, result: ImportResult) -> None:
+    """A corrected file replaces the description of the same workflow; the review runs again."""
+    wf.description = result.description or "Imported from a BPMN file."
+    if result.kind == "maestro":
+        _restore_export(db, wf, result)
+    else:
+        _queue_import(wf, result)
+    db.commit()
 
 
 def current_instructions(db: Session) -> list[dict[str, Any]]:
@@ -93,7 +166,7 @@ def _normalize_design(raw: dict[str, Any], previous: dict[str, Any] | None) -> d
     for i, st in enumerate(raw.get("steps") or []):
         actor = st.get("actor") if st.get("actor") in ACTORS else "maestro"
         steps.append({
-            "id": str(st.get("id") or f"S{i + 1}")[:12],
+            "id": str(st.get("id") or f"S{i + 1}")[:MAX_STEP_ID],
             "phase": str(st.get("phase") or "").strip()[:60],
             "title": str(st.get("title") or "Step").strip()[:80],
             "detail": str(st.get("detail") or "").strip()[:160],
@@ -104,7 +177,7 @@ def _normalize_design(raw: dict[str, Any], previous: dict[str, Any] | None) -> d
             "loop": tag_text(st.get("loop")),
             "done_when": st.get("done_when") if actor == "dispatch" and st.get("done_when") in DONE_WHEN else "none",
             "branch": tag_text(st.get("branch"))[:40],
-            "loop_to": str(st.get("loop_to") or "").strip()[:12],
+            "loop_to": str(st.get("loop_to") or "").strip()[:MAX_STEP_ID],
         })
     # A loop can only go back to an earlier step.
     seen: set[str] = set()
@@ -127,7 +200,8 @@ def _normalize_design(raw: dict[str, Any], previous: dict[str, Any] | None) -> d
             for a in raw.get("instruction_adjustments") or [] if isinstance(a, dict)
         ][:20],
         "not_possible": [
-            {"need": str(n.get("need", "")), "alternative": str(n.get("alternative", ""))}
+            {"need": str(n.get("need", "")), "alternative": str(n.get("alternative", "")),
+             "element_id": str(n.get("element_id") or "").strip()[:200]}
             for n in raw.get("not_possible") or []
         ][:20],
         "tools": [str(t) for t in raw.get("tools") or []][:20],
@@ -168,8 +242,15 @@ def decisions_block(clar: dict[str, Any] | None) -> str:
     decisions = (clar or {}).get("decisions") or []
     if not decisions:
         return ""
-    lines = "\n".join(f"- {d['question']} -> {d['answer']}" for d in decisions)
-    return f"\n\nDecisions made by the user (final, apply them):\n{lines}"
+    lines = "\n".join(
+        f"- {'[BPMN element ' + d['element_id'] + '] ' if d.get('element_id') else ''}{d['question']} -> {d['answer']}"
+        for d in decisions
+    )
+    note = ""
+    if any(d.get("element_id") for d in decisions):
+        note = ("\nEvery [BPMN element ...] decision is a final choice about something that cannot run as drawn: "
+                "list each of them in not_possible, with the original need and the chosen route as the alternative.")
+    return f"\n\nDecisions made by the user (final, apply them):\n{lines}{note}"
 
 
 def normalize_questions(raw: list[Any]) -> list[dict[str, Any]]:
@@ -205,16 +286,112 @@ def answer_questions(db: Session, wf: Workflow, answers: dict[str, str]) -> list
     return []
 
 
+# --- BPMN import review -----------------------------------------------------------------------------
+
+MAX_ISSUES = 8
+GENERIC_PROBLEM = "This BPMN element is not supported"
+GENERIC_OPTIONS = [
+    {"label": "Describe it as a step done by a person",
+     "effect": "The designer adds a human step that does what this element stands for."},
+    {"label": "Leave it out", "effect": "This element does not appear in the workflow."},
+]
+
+
+def _ref_ids(value: str) -> list[str]:
+    return [p for p in re.split(r"[,\s]+", value or "") if p]
+
+
+def normalize_issues(raw: list[Any], findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The review's issues, cleaned, plus a generic issue for every finding the model left out.
+
+    The model's issues are capped at 8, most blocking first. The generic ones come on top of that cap on purpose:
+    every deterministic finding must reach the user.
+    """
+    issues: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    covered: set[str] = set()
+
+    def unique_id(wanted: str, fallback: str) -> str:
+        iid = re.sub(r"[^A-Za-z0-9_-]", "", wanted)[:16] or fallback
+        while iid in seen:
+            iid += "x"
+        seen.add(iid)
+        return iid
+
+    for i, q in enumerate(raw[:MAX_ISSUES]):
+        if not isinstance(q, dict):
+            continue
+        problem = str(q.get("problem") or "").strip()[:300]
+        options = [{"label": str(o.get("label")).strip()[:120], "effect": str(o.get("effect") or "").strip()[:240]}
+                   for o in q.get("options") or [] if isinstance(o, dict) and str(o.get("label") or "").strip()][:4]
+        if not problem or len(options) < 2:
+            continue  # unusable: a finding it was about gets a generic issue below
+        refs = _ref_ids(str(q.get("element_id") or ""))
+        covered.update(refs)
+        issues.append({
+            "id": unique_id(str(q.get("id") or ""), f"I{i + 1}"),
+            "element_id": ", ".join(refs)[:200],
+            "element_name": str(q.get("element_name") or "").strip()[:120],
+            "problem": problem,
+            "why": str(q.get("why") or "").strip()[:240],
+            "options": options,
+        })
+    for n, f in enumerate((f for f in findings if f.get("element_id") not in covered), start=1):
+        issues.append({
+            "id": unique_id(f"G{n}", f"G{n}"),
+            "element_id": str(f.get("element_id") or "")[:200],
+            "element_name": str(f.get("element_name") or f.get("element_id") or "")[:120],
+            "problem": GENERIC_PROBLEM,
+            "why": str(f.get("detail") or f"{f.get('element_type')} elements are not supported")[:240],
+            "options": [dict(o) for o in GENERIC_OPTIONS],
+        })
+    return issues
+
+
+def answer_import_review(db: Session, wf: Workflow, choices: dict[str, tuple[str, str]]) -> list[str]:
+    """Record the chosen route of each issue as a final decision and queue the pipeline.
+
+    `choices` maps an issue id to (picked option label or "__other__", the text written for Other).
+    Returns the ids of the issues still unanswered (nothing is stored then).
+    """
+    clar = dict(wf.clarifications or {})
+    issues = clar.get("questions") or []
+    decisions, missing = [], []
+    for q in issues:
+        choice, other = choices.get(q["id"], ("", ""))
+        option = next((o for o in q["options"] if o["label"] == choice), None)
+        if option is not None:
+            answer = f"{option['label']} — {option['effect']}" if option["effect"] else option["label"]
+        elif choice == "__other__" and other.strip():
+            answer = other.strip()
+        else:
+            missing.append(q["id"])
+            continue
+        name = q.get("element_name") or q.get("element_id") or ""
+        question = q["problem"] if not name or name in q["problem"] else f"{name}: {q['problem']}"
+        decisions.append({"question": question, "answer": answer[:500], "element_id": q.get("element_id", "")})
+    if missing:
+        return missing
+    wf.clarifications = {**clar, "questions": [], "decisions": list(clar.get("decisions") or []) + decisions}
+    wf.design_status = "queued"
+    wf.design_error = None
+    db.commit()
+    return []
+
+
 # --- Design progress -------------------------------------------------------------
 
 STAGES = ("tools", "clarify", "design")
+IMPORT_STAGES = ("review",) + STAGES  # an imported BPMN file starts with the review of what cannot run as drawn
+ALL_STAGES = IMPORT_STAGES
 STAGE_LABELS = {
+    "review": "Reviewing the BPMN file",
     "tools": "Checking the tools it needs",
     "clarify": "Looking for decisions to ask you",
     "design": "Designing the project",
 }
 # Typical durations (seconds) and design length (characters) before any generation has been timed.
-DEFAULT_TIMINGS = {"tools": 15.0, "clarify": 40.0, "design": 240.0, "design_chars": 20000.0}
+DEFAULT_TIMINGS = {"review": 45.0, "tools": 15.0, "clarify": 40.0, "design": 240.0, "design_chars": 20000.0}
 # What the designer is writing, by JSON key, in output order.
 WRITING_LABELS = [
     ("summary", "Summarizing the process"),
@@ -247,10 +424,10 @@ def _start_stage(db: Session, wf: Workflow, stage: str) -> None:
     now = utcnow()
     timings = dict(progress.get("current_timings") or {})
     previous, started = progress.get("stage"), _parse(progress.get("stage_started"))
-    if previous in STAGES and started and previous != stage:
+    if previous in ALL_STAGES and started and previous != stage:
         timings[previous] = round((now - started).total_seconds(), 1)
     done = list(progress.get("done") or [])
-    if previous in STAGES and previous != stage and previous not in done:
+    if previous in ALL_STAGES and previous != stage and previous not in done:
         done.append(previous)
     _set_progress(db, wf, stage=stage, stage_started=_iso(now), done=done, current_timings=timings,
                   phase="thinking" if stage == "design" else None, chars=0, writing=None)
@@ -265,10 +442,13 @@ def _skip_stage(wf: Workflow, stage: str, note: str) -> None:
     wf.design_progress = {**progress, "done": done, "notes": {**(progress.get("notes") or {}), stage: note}}
 
 
-def _begin_generation(db: Session, wf: Workflow) -> None:
+def _begin_generation(db: Session, wf: Workflow, with_review: bool = False) -> None:
     last = (wf.design_progress or {}).get("timings")
-    wf.design_progress = {"started": _iso(utcnow()), "timings": last}
-    _start_stage(db, wf, "tools")
+    progress: dict[str, Any] = {"started": _iso(utcnow()), "timings": last}
+    if with_review:  # imports only: the other projects keep their three rows
+        progress["stages"] = list(IMPORT_STAGES)
+    wf.design_progress = progress
+    _start_stage(db, wf, "review" if with_review else "tools")
 
 
 def _finish_generation(db: Session, wf: Workflow, design_chars: int | None) -> None:
@@ -276,7 +456,7 @@ def _finish_generation(db: Session, wf: Workflow, design_chars: int | None) -> N
     progress = dict(wf.design_progress or {})
     timings = dict(progress.get("current_timings") or {})
     started = _parse(progress.get("stage_started"))
-    if progress.get("stage") in STAGES and started:
+    if progress.get("stage") in ALL_STAGES and started:
         timings[progress["stage"]] = round((utcnow() - started).total_seconds(), 1)
     if design_chars:
         timings["design_chars"] = design_chars
@@ -310,7 +490,7 @@ def progress_view(wf: Workflow, estimates: dict[str, float]) -> dict[str, Any] |
     stage_started = _parse(progress.get("stage_started"))
     elapsed_stage = (now - stage_started).total_seconds() if stage_started and stage else 0.0
     rows, remaining, total, spent = [], 0.0, 0.0, 0.0
-    for key in STAGES:
+    for key in progress.get("stages") or STAGES:
         expected = max(estimates[key], 1.0)
         total += expected
         if key in done:
@@ -369,6 +549,25 @@ def writing_label(text_tail: str) -> str | None:
     return label
 
 
+def review_import(db: Session, wf: Workflow, client: Any, settings: Any, instructions: str,
+                  services: list[str]) -> bool:
+    """Review an imported BPMN file. True when the dialog must be shown (status set to needs_answers)."""
+    findings = list((wf.clarifications or {}).get("findings") or [])
+    raw = client.review_import(settings.model, wf.description, findings, services, CONNECTOR_KEYS, instructions)
+    issues = normalize_issues(raw.get("issues") or [], findings)
+    if not issues:
+        wf.clarifications = None  # nothing to decide: straight on to the tool check
+        db.commit()
+        return False
+    wf.clarifications = {"kind": "import_review", "questions": issues, "findings": findings, "decisions": []}
+    wf.design_status = "needs_answers"
+    wf.design_error = None
+    wf.design_updated_at = utcnow()
+    _finish_generation(db, wf, None)
+    db.commit()
+    return True
+
+
 def generate_design(db: Session, wf_id: int) -> None:
     """Called by the worker in a background thread."""
     wf = db.get(Workflow, wf_id)
@@ -378,15 +577,23 @@ def generate_design(db: Session, wf_id: int) -> None:
     assert user is not None
     settings = get_user_settings(db, user)
     try:
-        _begin_generation(db, wf)
+        pending_review = (wf.clarifications or {}).get("kind") == "import_pending"
+        _begin_generation(db, wf, with_review=pending_review)
         client = client_for(settings)
         # System instructions (admin) apply to every workflow and take precedence over the description.
         skills = current_instructions(db)
         instructions, ihash = instructions_block(skills), instructions_hash(skills)
         diagram = {"media_type": wf.diagram_media_type, "data": wf.diagram_data} if wf.diagram_data else None
+        # 0. An imported BPMN file: what cannot run as drawn goes to the user first (the dialog).
+        if pending_review and review_import(db, wf, client, settings, instructions,
+                                            sorted(connector_policies(db, user))):
+            return
         # 1. Tool check first (cheap): never write a prompt that needs a tool Maestro cannot use.
         text = wf.description + (f"\n\nRequested change: {wf.design_feedback}" if wf.design_feedback else "")
-        check = client.check_tools(settings.model, text, instructions, diagram)
+        clar = dict(wf.clarifications or {})
+        if pending_review:
+            _start_stage(db, wf, "tools")
+        check = client.check_tools(settings.model, text + decisions_block(clar), instructions, diagram)
         needed = sorted({c for c in check.get("connectors_needed") or [] if c in CONNECTOR_NAMES})
         blocked = blocking_message(needed, set(connector_policies(db, user)), check.get("unsupported_tools") or [])
         if blocked:
@@ -398,7 +605,6 @@ def generate_design(db: Session, wf_id: int) -> None:
             return
         # 2. Clarify: ask the user the decisions that make the workflow executable (once per request)
         services = sorted(connector_policies(db, user))
-        clar = dict(wf.clarifications or {})
         request_hash = hashlib.sha256((text + ihash + fingerprint(wf.diagram_data)).encode()).hexdigest()
         if clar.get("for") != request_hash:
             _start_stage(db, wf, "clarify")

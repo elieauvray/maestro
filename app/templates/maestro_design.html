@@ -67,7 +67,7 @@
     <h2 class="section-title">Not possible with Dispatch today</h2>
     <table>
       <thead><tr><th>Need</th><th>Alternative chosen</th></tr></thead>
-      <tbody>{% for n in design.not_possible %}<tr><td>{{ n.need }}</td><td>{{ n.alternative }}</td></tr>{% endfor %}</tbody>
+      <tbody>{% for n in design.not_possible %}<tr><td>{{ n.need }}{% if n.element_id %} <code class="small">{{ n.element_id }}</code>{% endif %}</td><td>{{ n.alternative }}</td></tr>{% endfor %}</tbody>
     </table>
   </section>
   {% endif %}
@@ -77,7 +77,7 @@
     <h2 class="section-title">Your decisions</h2>
     <table>
       <thead><tr><th>Question</th><th>Decision</th></tr></thead>
-      <tbody>{% for d in wf.clarifications.decisions %}<tr><td>{{ d.question }}</td><td>{{ d.answer }}</td></tr>{% endfor %}</tbody>
+      <tbody>{% for d in wf.clarifications.decisions %}<tr><td>{{ d.question }}{% if d.element_id %} <code class="small">{{ d.element_id }}</code>{% endif %}</td><td>{{ d.answer }}</td></tr>{% endfor %}</tbody>
     </table>
   </section>
   {% endif %}

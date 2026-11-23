@@ -134,6 +134,13 @@ tracker, a report), design the workflow so it complies, and record each change i
 change. Write the orchestration prompt so it already complies; do not copy the instructions into it, Maestro
 receives them on every run. They never override the Dispatch rules above (hands off during Dispatch runs,
 separate trigger comment, connected tools only).
+
+BPMN import: when the request lists decisions marked "[BPMN element <id>]", the process was imported from a
+BPMN 2.0 file and the user already chose a route for that element. Apply each of these decisions as final.
+Keep the BPMN element ids as step ids where a BPMN task maps to one step (never invent new ids for them).
+List EVERY element that had such a decision in "not_possible": "need" is what the BPMN element asked for
+(mention its name), "alternative" is the route the user chose, and "element_id" is the BPMN element id.
+Leave "element_id" empty for the entries that do not come from a BPMN element.
 """
 
 DESIGN_SCHEMA: dict = {
@@ -192,8 +199,9 @@ DESIGN_SCHEMA: dict = {
             "type": "array",
             "items": {
                 "type": "object",
-                "properties": {"need": {"type": "string"}, "alternative": {"type": "string"}},
-                "required": ["need", "alternative"],
+                "properties": {"need": {"type": "string"}, "alternative": {"type": "string"},
+                               "element_id": {"type": "string"}},
+                "required": ["need", "alternative", "element_id"],
                 "additionalProperties": False,
             },
         },
@@ -234,6 +242,11 @@ diagram shows that tool, then answer for the changed process. A replaced tool is
 
 System instructions: when the request contains a <system_instructions> block, it applies to this workflow
 too. Count the tools it requires Maestro to use (for example "every workflow reports in Linear") as needed.
+
+Decisions: when the request ends with "Decisions made by the user (final...)", they are final. Count the tools
+the chosen routes need as needed (a route "comment in the tracker" needs the tracker connector). A route that
+replaces a tool, makes it a step done by a person, or leaves it out makes the original tool neither needed nor
+unsupported. Decisions marked "[BPMN element <id>]" come from an imported BPMN file and follow the same rule.
 """
 
 TOOLS_SCHEMA: dict = {
@@ -273,7 +286,8 @@ description, for example:
   and the choice changes the design.
 Do not ask about what the description already states, about details Maestro can decide sensibly, or about
 config values (repository names, people's handles): those become config keys later.
-Previous decisions, when given, are final: never ask them again.
+Previous decisions, when given, are final: never ask them again. That includes the ones marked
+"[BPMN element <id>]" (routes the user chose when importing a BPMN file): never ask about those elements.
 
 Return at most 6 questions, most important first. Each question has 2 to 4 short options; the FIRST option
 is the one you recommend. Add a one-line "why" explaining what the answer changes. Write in the language of
@@ -302,5 +316,90 @@ CLARIFY_SCHEMA: dict = {
         },
     },
     "required": ["questions"],
+    "additionalProperties": False,
+}
+
+
+# --- BPMN import review (runs first for an imported file, before the tool check) -----------------
+
+IMPORT_REVIEW_SYSTEM = """You review a process imported from a BPMN 2.0 file before Maestro designs it. The user
+drew it in a BPMN tool; Maestro does not execute BPMN, it designs a meta-workflow from the process. Your job is
+to find what cannot run as drawn with Maestro and Upsun Dispatch as they are today (see the knowledge below), and
+to offer concrete alternative implementation routes for each problem. You never write or edit BPMN or any XML.
+
+The request gives: the connectors the user has configured, the connectors Maestro supports ("linear", "github",
+"atlassian"), the process described in English (parsed from the file, in flow order), and a list of findings:
+elements found by a deterministic check as not supported (boundary events, message flows and second pools,
+event subprocesses, compensation, parallel and inclusive gateways, data objects and stores, script and business
+rule tasks, signal and escalation events, transactions).
+
+Return the problems in "issues", at most 8, most blocking first. Report:
+- every finding of the list (each one must be covered by an issue, use its element id in "element_id"; one
+  issue can cover several findings: separate their ids with commas);
+- any other step the description asks for that Maestro or Dispatch cannot do as drawn, even when it is not in the
+  findings (a tool Maestro has no connector for, a custom Dispatch workflow, Maestro acting inside a running
+  Dispatch workflow, a wait for a real-time event).
+Do not report what works as drawn.
+
+Each issue has:
+- "id": a short id (I1, I2...);
+- "element_id" and "element_name": the BPMN element(s) concerned;
+- "problem": one sentence on what cannot be done as drawn;
+- "why": which Maestro or Dispatch limit applies;
+- "options": 2 to 4 concrete alternative implementation routes, the one you recommend FIRST. Each has a short
+  "label" and a one-line "effect" on the workflow.
+
+Typical problems and the kinds of routes to consider. These are examples, never fixed answers: choose the routes
+that fit this process.
+- A tool Maestro has no connector for (email, Slack, GitLab, Teams): replace it with a tracker comment that
+  mentions the person; keep it as a manual step done by a person. Offer "Connect it in Settings, then continue"
+  ONLY for a supported connector that is not configured yet.
+- A custom Dispatch workflow or a chain inside Dispatch: split it into separate Issue to code runs, chained by
+  Maestro after each pull request is merged; use the automatic Code review on the pull request.
+- Maestro acting inside a running Dispatch workflow (approving a plan, fixing a pull request, merging): a named
+  person does it in the tracker or on the pull request; Maestro waits for the completion signal, then continues.
+- A parallel gateway: run the branches as separate items tracked in the ledger, each advancing on its own; make
+  them sequential.
+- A boundary timer or SLA: check the elapsed time on each scheduled run and escalate with a comment.
+- A message to another pool: a comment in the tracker addressed to that party.
+- Waiting for a real-time event: check on the next scheduled run (hourly by default).
+
+Write in the language of the description. Keep labels short and effects to one line. Never invent Dispatch
+features beyond the knowledge below. If nothing needs a decision, return an empty list.
+
+System instructions: when the request contains a <system_instructions> block, it applies to this workflow too and
+takes precedence over the process description. Never offer a route that contradicts it, and make the route that
+complies the recommended one.
+"""
+
+IMPORT_REVIEW_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "element_id": {"type": "string"},
+                    "element_name": {"type": "string"},
+                    "problem": {"type": "string"},
+                    "why": {"type": "string"},
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"label": {"type": "string"}, "effect": {"type": "string"}},
+                            "required": ["label", "effect"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["id", "element_id", "element_name", "problem", "why", "options"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["issues"],
     "additionalProperties": False,
 }

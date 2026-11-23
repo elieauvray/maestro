@@ -65,12 +65,13 @@ lives in a "ledger" (an edited comment) on each tracked item.
 ## Contents
 
 1. [Architecture](#architecture)
-2. [Local setup](#local-setup)
-3. [Deploying on Upsun](#deploying-on-upsun)
-4. [Connector configuration](#connector-configuration)
-5. [Security](#security)
-6. [Tests](#tests)
-7. [Known limitations](#known-limitations)
+2. [BPMN 2.0 import](#bpmn-20-import)
+3. [Local setup](#local-setup)
+4. [Deploying on Upsun](#deploying-on-upsun)
+5. [Connector configuration](#connector-configuration)
+6. [Security](#security)
+7. [Tests](#tests)
+8. [Known limitations](#known-limitations)
 
 ## Architecture
 
@@ -167,6 +168,56 @@ System instructions set by the administrator of this application. They apply to 
 WORKFLOW CONTENT
 </workflow>
 ```
+
+## BPMN 2.0 import
+
+On *Create* ("Describe your project"), the drop zone also accepts a BPMN 2.0 file (`.bpmn`) from Maestro or any
+BPMN tool. A `.bpmn` file posts to `POST /maestro/import-bpmn` (CSRF, multipart) and the project takes the process
+name (made unique among your projects: "X", "X (2)"). **Maestro does not execute BPMN**: the file is an input to the
+design. No LLM ever reads or writes the XML; parsing is deterministic (`app/maestro/bpmn.py`).
+
+**Safe parsing.** The file is parsed with `defusedxml`. A DOCTYPE, entities and external references are rejected,
+the size limit is 2 MB, the root must be `definitions` in the BPMN 2.0 MODEL namespace
+(`http://www.omg.org/spec/BPMN/20100524/MODEL`) and the file must contain at least one `process`. An invalid file
+shows an error and creates no project.
+
+**Two cases.**
+- **A Maestro file that was not changed.** The `maestro:design` block holds the stored design and
+  `maestro:stepsHash` matches the steps rebuilt from the BPMN elements (and the stored steps). The design is restored
+  as is, status `ready`, with no review and no Anthropic call.
+- **Any other file** (another tool, or a Maestro file edited since the export). The process becomes a structured
+  English description (lanes as roles, tasks in flow order with type, lane, id and documentation, gateways and their
+  conditions, loops, multi-instance markers, timer start) plus **deterministic findings**, one per element that
+  cannot run as drawn. A new review step (one structured Messages API call, the model chosen in Settings, `high`
+  effort) then returns at most 8 issues. Each has the problem, the Maestro or Dispatch limit that applies and 2 to 4
+  alternative routes, the recommended one first. Every finding is always covered: when the review leaves one out, a
+  generic issue "This BPMN element is not supported" is added (options: "Describe it as a step done by a person",
+  "Leave it out", or your own).
+
+**The review dialog.** When there are issues, the project is `needs_answers` (the same status as the Clarify
+questions; the state is kept in `workflows.clarifications` with `kind = "import_review"`, no migration). For each
+issue you see the element name and BPMN id, the problem, why, and the routes as radio buttons with the effect of
+each, the first one selected and badged "recommended", plus "Other" with a text field. *Continue* stores each choice as
+a **final decision** (`question`, `answer`, `element_id`) and runs the normal pipeline (tool check, Clarify, designer):
+the tool check counts the tools the chosen routes need, Clarify never asks these again, and the designer keeps the
+BPMN ids as step ids where a task maps to one step and lists every reviewed issue in "Not possible with Dispatch today"
+with the chosen route. *Import a corrected file* replaces the description of the same project and reviews it again;
+*Cancel import* deletes the project after a confirmation page. Without any issue, the dialog is skipped and the
+design starts straight away.
+
+**Supported subset.** One process (lanes become roles), user, service, call activity, manual, send, receive and plain
+tasks, exclusive gateways, sequence flows (including loops back), multi-instance markers, a timer start event, and
+intermediate and end events. A file written by Maestro also carries its design in the `maestro:` namespace
+(`https://upsun.com/schema/maestro/1`).
+
+**Unsupported elements** (each one produces a finding):
+- boundary events (timer, message, error...), message flows and more than one participant (pool);
+- event subprocesses and transactions;
+- compensation (events and handlers);
+- parallel and inclusive gateways;
+- data objects and data stores (and their references);
+- script and business rule tasks;
+- signal and escalation events.
 
 ## Local setup
 
@@ -362,6 +413,7 @@ TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/dispatch_test pytest -q
 
 ## Known limitations
 
+- **BPMN import**: a Maestro file is restored as is only when its steps are unchanged; any edit sends it through the review. The routes chosen in the review are not written back to a BPMN file (the next export reflects the new design), and there is no in-app BPMN editor.
 - **Question detection**: heuristic, the last line of Claude's message must end with "?". In any case, the user can continue the conversation.
 - **Atlassian with a static token**: personal API tokens (Basic `email:token`) are not compatible with `static_bearer`. Use OAuth or a service account key.
 - **The "Test" button** cannot redo the authenticated handshake for a static token, since the token is not kept. It checks the credential on the vault side and that the server is reachable. The full handshake happens when saving.

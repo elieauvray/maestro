@@ -268,6 +268,8 @@ class ManagedAgentsAPI(Protocol):
                     diagram: dict[str, Any] | None = None) -> dict[str, Any]: ...
     def clarify_workflow(self, model: str, description: str, services: list[str],
                          instructions: str = "", diagram: dict[str, Any] | None = None) -> dict[str, Any]: ...
+    def review_import(self, model: str, description: str, findings: list[dict[str, Any]], services: list[str],
+                      supported: list[str], instructions: str = "") -> dict[str, Any]: ...
     def archive_deployment(self, deployment_id: str) -> None: ...
 
 
@@ -584,6 +586,46 @@ class ManagedAgentsClient:
             return json.loads(text)
         except ValueError as exc:
             raise ManagedAgentsError("Could not read the clarification questions.") from exc
+
+    def review_import(self, model: str, description: str, findings: list[dict[str, Any]], services: list[str],
+                      supported: list[str], instructions: str = "") -> dict[str, Any]:
+        """What cannot run as drawn in an imported BPMN process, with alternative routes (structured output)."""
+        from app.maestro.knowledge import DISPATCH_KNOWLEDGE, IMPORT_REVIEW_SCHEMA, IMPORT_REVIEW_SYSTEM
+
+        configured = ", ".join(services) if services else "none"
+        params: dict[str, Any] = {
+            "model": model,
+            "max_tokens": 8000,
+            "system": [
+                {"type": "text", "text": IMPORT_REVIEW_SYSTEM},
+                {"type": "text", "text": DISPATCH_KNOWLEDGE, "cache_control": {"type": "ephemeral"}},
+            ],
+            "messages": [{"role": "user", "content": (
+                f"Connectors the user has configured: {configured}.\n"
+                f"Connectors Maestro supports: {', '.join(supported)}.\n\n"
+                + (instructions + "\n\n" if instructions else "")
+                + f"<process_description>\n{description}\n</process_description>\n\n"
+                + "<findings>\n" + json.dumps(findings, ensure_ascii=False) + "\n</findings>"
+            )}],
+            "output_config": {"effort": "high", "format": {"type": "json_schema", "schema": IMPORT_REVIEW_SCHEMA}},
+        }
+        if model in _FALLBACK_MODELS:
+            params["betas"] = ["server-side-fallback-2026-07-01"]
+            params["fallbacks"] = "default"
+        with self._wrap():
+            response = self._client.beta.messages.create(**params)
+        if response.stop_reason == "refusal":
+            raise ManagedAgentsError("Claude declined to review this BPMN file.")
+        if response.stop_reason == "max_tokens":
+            raise ManagedAgentsError("The review of the BPMN file was too long to generate.")
+        text = next((b.text for b in response.content if b.type == "text"), "")
+        try:
+            review = json.loads(text)
+        except ValueError as exc:
+            raise ManagedAgentsError("Could not read the review of the BPMN file.") from exc
+        if not isinstance(review, dict):
+            raise ManagedAgentsError("Could not read the review of the BPMN file.")
+        return review
 
     # -- old schedules (Managed Agents deployments), archived once ------------------
     def archive_deployment(self, deployment_id: str) -> None:

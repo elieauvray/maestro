@@ -1,9 +1,10 @@
-{# Diagram picker shared by the describe and edit pages. With `current` (a workflow that has a diagram),
+{# Diagram picker shared by the describe and edit pages. `allow_bpmn` (describe page only) also accepts a .bpmn file. With `current` (a workflow that has a diagram),
    it shows that diagram and lets you replace or remove it. #}
-<div class="diagram-drop" id="diagram-drop">
+<div class="diagram-drop" id="diagram-drop"{% if allow_bpmn %} data-bpmn="1"{% endif %}>
   <label for="diagram" style="margin:0">
     <strong>Process diagram</strong> <span class="muted small">(optional)</span><br>
-    <span class="small muted">Paste an image into the description, drop a file here, or choose an image (PNG, JPEG, GIF, WebP, 3.75 MB max) or a PDF (10 MB max). Maestro reads it like a description; the text takes precedence.</span>
+    <span class="small muted">Paste an image into the description, drop a file here, or choose an image (PNG, JPEG, GIF, WebP, 3.75 MB max) or a PDF (10 MB max). Maestro reads it like a description; the text takes precedence.</span>{% if allow_bpmn %}
+    <br><span class="small muted">BPMN 2.0 files (.bpmn) from Maestro or any BPMN tool.</span>{% endif %}
   </label>
   {% if current and current.diagram_media_type %}
   <div id="diagram-current" class="diagram-preview">
@@ -16,7 +17,7 @@
   </div>
   <p id="diagram-removed" class="small muted" hidden>The current diagram will be removed when you save. <a href="#" id="diagram-undo">Undo</a></p>
   {% endif %}
-  <input type="file" name="diagram" id="diagram" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf">
+  <input type="file" name="diagram" id="diagram" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf{% if allow_bpmn %},.bpmn{% endif %}">
   <div id="diagram-preview" class="diagram-preview" hidden>
     <img id="diagram-img" alt="Project diagram preview">
     <span id="diagram-name" class="small"></span>
