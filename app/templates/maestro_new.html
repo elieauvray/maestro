@@ -9,6 +9,7 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label>Name <input name="name" value="{{ name }}" required maxlength="128" placeholder="e.g. Legacy app migration, Client support (TMA)"></label>
     {% include "partials/share_switch.html" %}
+    {% set allow_bpmn = true %}
     {% include "partials/diagram_input.html" %}
 
     <label>Describe the project

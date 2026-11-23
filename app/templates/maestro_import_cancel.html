@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Cancel the import of {{ wf.name }}{% endblock %}
+{% block content %}
+<nav aria-label="breadcrumb"><ul><li><a href="/workflows">Projects</a></li><li><a href="/workflows/{{ wf.id }}/design">{{ wf.name }}</a></li><li>Cancel import</li></ul></nav>
+<h1>Cancel the import?</h1>
+<article>
+  <p>The project <strong>{{ wf.name }}</strong> was created from a BPMN file and is waiting for your choices. Cancelling deletes it. The file itself is not changed.</p>
+  <form method="post" action="/workflows/{{ wf.id }}/import/cancel">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row-actions">
+      <button type="submit" class="secondary">{{ icon('delete') }}Delete the import</button>
+      <a href="/workflows/{{ wf.id }}/design" role="button" class="secondary outline">{{ icon('back') }}Back</a>
+    </div>
+  </form>
+</article>
+{% endblock %}

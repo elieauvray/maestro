@@ -59,6 +59,9 @@ class FakeManagedAgents:
     tools_calls: list[str] = field(default_factory=list)
     clarify_response: dict[str, Any] = field(default_factory=lambda: {"questions": []})
     clarify_calls: list[str] = field(default_factory=list)
+    review_response: dict[str, Any] = field(default_factory=lambda: {"issues": []})
+    review_calls: list[dict[str, Any]] = field(default_factory=list)
+    design_not_possible: list[dict[str, str]] | None = None
     deployments: dict[str, dict[str, Any]] = field(default_factory=dict)
     deployment_runs: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
@@ -158,6 +161,12 @@ class FakeManagedAgents:
         self.diagrams_seen.append(("clarify", diagram))
         return self.clarify_response
 
+    def review_import(self, model, description, findings, services, supported, instructions=""):  # type: ignore[no-untyped-def]
+        self.review_calls.append({"description": description, "findings": findings, "services": services,
+                                  "supported": supported, "instructions": instructions})
+        self.instructions_seen.append(("review", instructions))
+        return self.review_response
+
     def check_tools(self, model, description, instructions="", diagram=None):  # type: ignore[no-untyped-def]
         self.tools_calls.append(description)
         self.instructions_seen.append(("tools", instructions))
@@ -190,7 +199,10 @@ class FakeManagedAgents:
             "config": [{"key": "REPO", "description": "GitHub owner/repo"}],
             "assumptions": ["GitHub is the code host"],
             "instruction_adjustments": list(self.design_adjustments),
-            "not_possible": [{"need": "Custom Dispatch workflow", "alternative": "Maestro chains Issue to code runs"}],
+            "not_possible": (
+                self.design_not_possible if self.design_not_possible is not None
+                else [{"need": "Custom Dispatch workflow", "alternative": "Maestro chains Issue to code runs"}]
+            ),
             "tools": ["GitHub connector"],
             "orchestration_prompt": "# Mission\nYou are the Executor of the page migration factory.",
         }

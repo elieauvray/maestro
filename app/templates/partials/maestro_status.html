@@ -32,6 +32,43 @@
   </div>
 {% elif not is_owner and wf.design_status in ['needs_answers', 'blocked', 'failed'] %}
   <div class="flash warning" role="status">This shared project is not ready yet. {{ owner_login }} has to finish its design.</div>
+{% elif wf.design_status == 'needs_answers' and wf.clarifications.kind == 'import_review' %}
+  <article class="clarify import-review">
+    <header><strong>Some parts of this BPMN can't run as drawn with Maestro and Upsun Dispatch. Pick how to handle each one.</strong>
+      <p class="small muted" style="margin:.3rem 0 0">The recommended route is selected. Your choices are final: Maestro designs the project with them.</p>
+    </header>
+    <form method="post" action="/workflows/{{ wf.id }}/design/answers" id="import-review-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      {% for q in wf.clarifications.questions %}
+      <fieldset class="clarify-q">
+        <legend>
+          {{ loop.index }}. {{ q.element_name or q.element_id }}
+          {% if q.element_id %}<code class="small">{{ q.element_id }}</code>{% endif %}
+        </legend>
+        <p style="margin:.2rem 0"><strong>{{ q.problem }}</strong></p>
+        {% if q.why %}<small class="help">{{ q.why }}</small>{% endif %}
+        {% for opt in q.options %}
+        <label><input type="radio" name="q:{{ q.id }}" value="{{ opt.label }}" {% if loop.first %}checked{% endif %}> {{ opt.label }}{% if loop.first %} <span class="badge configured">recommended</span>{% endif %}
+          {% if opt.effect %}<small class="help" style="display:block;margin-left:1.6rem">{{ opt.effect }}</small>{% endif %}
+        </label>
+        {% endfor %}
+        <label class="clarify-other"><input type="radio" name="q:{{ q.id }}" value="__other__"> Other
+          <input type="text" name="other:{{ q.id }}" placeholder="Your own route" onfocus="this.closest('label').querySelector('input[type=radio]').checked = true">
+        </label>
+      </fieldset>
+      {% endfor %}
+      <div class="row-actions">
+        <button type="submit">{{ icon('continue') }}Continue</button>
+        <a href="/workflows/{{ wf.id }}/import/cancel" role="button" class="secondary outline">{{ icon('delete') }}Cancel import</a>
+      </div>
+    </form>
+    <form method="post" action="/workflows/{{ wf.id }}/import-bpmn" enctype="multipart/form-data" style="margin-top:1rem">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>Corrected BPMN file <input type="file" name="bpmn" accept=".bpmn,.xml,application/xml,text/xml" required></label>
+      <small class="help">It replaces the description of this project and Maestro reviews it again. Your choices above are discarded.</small>
+      <button type="submit" class="secondary">{{ icon('refresh') }}Import a corrected file</button>
+    </form>
+  </article>
 {% elif wf.design_status == 'needs_answers' %}
   <article class="clarify">
     <header><strong>Maestro needs a few decisions before designing this project.</strong>

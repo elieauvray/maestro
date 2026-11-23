@@ -14,6 +14,7 @@ from app.anthropic_client import ManagedAgentsError
 from app.db import get_db
 from app.deps import csrf_protect, require_configured
 from app.maestro import service
+from app.maestro.bpmn import MAX_BYTES, BpmnImportError, ImportResult, bpmn_to_design
 from app.maestro.diagram import DIAGRAM_ONLY_DESCRIPTION, PDF_MAX_BYTES
 from app.maestro.diagram import validate as validate_diagram
 from app.maestro.render import render_design_svg, step_info
@@ -97,6 +98,81 @@ async def maestro_create(
                   status_code=400)
 
 
+async def _read_bpmn(upload: UploadFile | None) -> ImportResult:
+    """Read an uploaded .bpmn (at most 2 MB) and parse it. Raises BpmnImportError for an invalid file."""
+    if upload is None or not upload.filename:
+        raise BpmnImportError("Choose a BPMN file (.bpmn).")
+    return bpmn_to_design(await upload.read(MAX_BYTES + 1))
+
+
+def _in_import_review(wf: Workflow) -> bool:
+    return wf.design_status == "needs_answers" and (wf.clarifications or {}).get("kind") == "import_review"
+
+
+@router.post("/maestro/import-bpmn", dependencies=[Depends(csrf_protect)])
+async def maestro_import_bpmn(
+    request: Request,
+    shared: str = Form(""),
+    diagram: UploadFile | None = File(None),
+    user: User = Depends(require_configured),
+    db: Session = Depends(get_db),
+) -> Response:
+    try:
+        result = await _read_bpmn(diagram)
+        wf = service.create_imported_workflow(db, user, result, shared=bool(shared))
+    except (BpmnImportError, ManagedAgentsError) as exc:
+        flash(request, str(exc), "error")
+        return RedirectResponse("/maestro/new", status_code=303)
+    flash(request, "BPMN file imported." + (" Your design is restored." if wf.design_status == "ready"
+                                           else " Maestro is reviewing it."), "info")
+    return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+
+
+@router.post("/workflows/{workflow_id}/import-bpmn", dependencies=[Depends(csrf_protect)])
+async def design_reimport_bpmn(
+    request: Request,
+    workflow_id: int,
+    bpmn: UploadFile | None = File(None),
+    user: User = Depends(require_configured),
+    db: Session = Depends(get_db),
+) -> Response:
+    wf = _maestro(db, workflow_id, user)
+    if not _in_import_review(wf):
+        return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+    try:
+        result = await _read_bpmn(bpmn)
+    except BpmnImportError as exc:  # the workflow and its dialog stay as they were
+        flash(request, str(exc), "error")
+        return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+    service.reimport_workflow(db, wf, result)
+    flash(request, "Corrected file imported." + (" Your design is restored." if wf.design_status == "ready"
+                                                else " Maestro is reviewing it again."), "info")
+    return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+
+
+@router.get("/workflows/{workflow_id}/import/cancel")
+def import_cancel_page(
+    request: Request, workflow_id: int, user: User = Depends(require_configured), db: Session = Depends(get_db)
+) -> Response:
+    wf = _maestro(db, workflow_id, user)
+    if not _in_import_review(wf):
+        return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+    return render(request, "maestro_import_cancel.html", {"wf": wf})
+
+
+@router.post("/workflows/{workflow_id}/import/cancel", dependencies=[Depends(csrf_protect)])
+def import_cancel(
+    request: Request, workflow_id: int, user: User = Depends(require_configured), db: Session = Depends(get_db)
+) -> Response:
+    wf = _maestro(db, workflow_id, user)
+    if not _in_import_review(wf):
+        return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+    db.delete(wf)
+    db.commit()
+    flash(request, "Import cancelled.", "success")
+    return RedirectResponse("/workflows", status_code=303)
+
+
 @router.get("/workflows/{workflow_id}/diagram")
 def workflow_diagram(
     workflow_id: int, user: User = Depends(require_configured), db: Session = Depends(get_db)
@@ -161,6 +237,15 @@ async def design_answers(
     if wf.design_status != "needs_answers":
         return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
     form = await request.form()
+    if (wf.clarifications or {}).get("kind") == "import_review":
+        choices = {q["id"]: (str(form.get(f"q:{q['id']}") or ""), str(form.get(f"other:{q['id']}") or ""))
+                   for q in wf.clarifications.get("questions") or []}
+        if service.answer_import_review(db, wf, choices):
+            flash(request, "Choose how to handle every part (pick an option, or choose Other and write your own).",
+                  "error")
+        else:
+            flash(request, "Thanks. Maestro is designing the project with your choices.", "info")
+        return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
     answers: dict[str, str] = {}
     for q in (wf.clarifications or {}).get("questions") or []:
         choice = str(form.get(f"q:{q['id']}") or "")
