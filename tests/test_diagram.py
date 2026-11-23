@@ -9,6 +9,79 @@ from tests.test_maestro import _design, _setup
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 
 
+def _step(sid, actor="maestro", **extra):  # type: ignore[no-untyped-def]
+    return {"id": sid, "phase": "", "title": f"Title {sid}", "detail": f"Detail {sid}", "actor": actor,
+            "dispatch_workflow": "none", "gate_owner": "", "repeat": "", "loop": "", **extra}
+
+
+GOLDEN_DESIGNS = {
+    "empty": {},
+    "fake": {
+        "summary": "Migrate each page through Dispatch with human gates.",
+        "steps": [
+            {"id": "S1", "phase": "Spec", "title": "Write the stage issue", "detail": "Scope and context",
+             "actor": "maestro", "dispatch_workflow": "none", "gate_owner": "", "repeat": "per page", "loop": ""},
+            {"id": "S2", "phase": "Spec", "title": "Generate the spec", "detail": "Issue to code run",
+             "actor": "dispatch", "dispatch_workflow": "issue_to_code", "gate_owner": "", "repeat": "",
+             "loop": "", "done_when": "pr_merged"},
+            {"id": "S3", "phase": "Spec", "title": "Approve the spec PR", "detail": "",
+             "actor": "human", "dispatch_workflow": "none", "gate_owner": "PO", "repeat": "", "loop": ""},
+            {"id": "S4", "phase": "Tests", "title": "Run e2e on <preview>", "detail": "",
+             "actor": "upsun", "dispatch_workflow": "none", "gate_owner": "", "repeat": "", "loop": ""},
+        ],
+    },
+    "branches": {
+        "summary": "Branches",
+        "steps": [
+            _step("B0", "human", branch="Left"), _step("B1", "dispatch", branch="Right", done_when="pr_opened"),
+            _step("B2", "upsun", branch="Left"),
+            _step("A1", "maestro", phase="One"), _step("A2", "human", gate_owner="PO", phase="One"),
+            _step("A3", "external", branch="Yes", phase="Two"), _step("A4", "maestro", branch="No", phase="Two"),
+            _step("A5", "dispatch", branch="Maybe", phase="Two", dispatch_workflow="code_review"),
+            _step("A6", "maestro", branch="Yes", phase="Two"),
+            _step("A7", "upsun", phase="Three"),
+        ],
+    },
+    "loops": {
+        "summary": "Loops",
+        "steps": [
+            _step("L1", "maestro", phase="Build"), _step("L2", "dispatch", loop="tests fail", loop_to="L1",
+                                                         dispatch_workflow="issue_to_code"),
+            _step("L3", "human", loop_to="L1", gate_owner="PO"), _step("L4", "upsun", loop="no label", loop_to="ZZ"),
+            _step("L5", "maestro", branch="Fast", loop="not green yet", loop_to="L5"),
+            _step("L6", "upsun", branch="Slow"), _step("L7", "maestro", branch="Slow", loop="retry", loop_to="L6"),
+            _step("L8", "human", repeat="for each page", loop="rejected", loop_to="L2"),
+        ],
+    },
+    "escaping": {
+        "summary": "Tom & <Jerry> \"quotes\"",
+        "steps": [
+            _step("E1", "maestro", phase="Phase <1> & more", title="A <b>bold</b> & 'quoted' title",
+                  detail="x" * 200),
+            _step("E2", "weird-actor", title="y" * 120, repeat="none", loop="n/a"),
+        ],
+    },
+}
+# SHA-256 of str(render_design_svg(design)) recorded from the renderer before compute_layout() was extracted.
+GOLDEN_SVG_HASHES = {
+    "empty": "b7b8093e91c21702025208a18340a6c65de7be314ed44b14966cf3caf5fac8fd",
+    "fake": "debb5c08823cbdb4ffab96beaf7a786e65364294d8a220a0d82c705228d0e80f",
+    "branches": "7c2c12d1a8ba4870d860c59529a37f5f725c4a8966767f2bef616c3166c27609",
+    "loops": "b920e78cfee37c7061120fed3b3e88fdb8bd01a497a0dbf49c0bf47f589dd28c",
+    "escaping": "bc64f111378c87a6b63f923a7154e129702325b3f1df58c2c9ac2b66794ad358",
+}
+
+
+def test_the_svg_diagram_renders_exactly_as_before_compute_layout():
+    import hashlib
+
+    from app.maestro.render import render_design_svg
+
+    for name, design in GOLDEN_DESIGNS.items():
+        digest = hashlib.sha256(str(render_design_svg(design)).encode()).hexdigest()
+        assert digest == GOLDEN_SVG_HASHES[name], name
+
+
 def _post(client, files, description=""):  # type: ignore[no-untyped-def]
     token = csrf(client, "/maestro/new")
     return client.post("/maestro/new", data={"name": "From a diagram", "description": description, "csrf_token": token},

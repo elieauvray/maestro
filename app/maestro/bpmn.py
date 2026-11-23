@@ -1,6 +1,10 @@
-"""BPMN 2.0 import for Maestro: safe, deterministic parsing. No LLM ever reads or writes the XML.
+"""BPMN 2.0 import and export for Maestro: safe, deterministic conversion. No LLM ever reads or writes the XML.
 
-Two kinds of files come in:
+Export: `design_to_bpmn()` turns the stored design JSON into a BPMN 2.0 file with diagram interchange (lanes by
+actor, tasks, gateways, flows), plus a `maestro:design` block that restores the design exactly. BPMN is an
+exchange and governance format here, not an execution format: the process has `isExecutable="false"`.
+
+Import. Two kinds of files come in:
 - a Maestro file that was not changed (`maestro:design` holds the stored design and `maestro:stepsHash` matches the
   steps rebuilt from the BPMN elements): the stored design is restored as is;
 - any other file (another tool, or a Maestro file edited since): it becomes an English description plus
@@ -17,12 +21,28 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
-from xml.etree.ElementTree import Element, ParseError
+from xml.etree.ElementTree import Element, ParseError, SubElement, indent, register_namespace, tostring
 
 from defusedxml import DefusedXmlException
 from defusedxml.ElementTree import fromstring as safe_fromstring
+
+from app.maestro.render import (
+    ACTOR_LABELS,
+    ACTOR_ORDER,
+    DISPATCH_LABELS,
+    DONE_LABELS,
+    BranchBlock,
+    Layout,
+    PhaseBand,
+    Placement,
+    StepBlock,
+    compute_layout,
+    tag_text,
+)
 
 MAX_BYTES = 2 * 1024 * 1024
 MODEL_NS = "http://www.omg.org/spec/BPMN/20100524/MODEL"
@@ -484,3 +504,452 @@ def bpmn_to_design(xml: bytes | str) -> ImportResult:
             return ImportResult("maestro", _clip(str(data.get("name") or ""), 128) or name,
                                 str(data.get("description") or ""), design, [])
     return ImportResult("foreign", name, build_description(root, ids, findings), None, findings)
+
+
+# --- Export: stored design to BPMN 2.0 with diagram interchange ------------------------------------------
+
+BPMNDI_NS = "http://www.omg.org/spec/BPMN/20100524/DI"
+DC_NS = "http://www.omg.org/spec/DD/20100524/DC"
+DI_NS = "http://www.omg.org/spec/DD/20100524/DI"
+XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
+BPMNDI = "{" + BPMNDI_NS + "}"
+DC = "{" + DC_NS + "}"
+DI = "{" + DI_NS + "}"
+XSI = "{" + XSI_NS + "}"
+EXPORT_VERSION = "1"
+
+TASK_TAGS = {"human": "userTask", "dispatch": "callActivity", "external": "task"}  # maestro, upsun: serviceTask
+# (maestro: attribute, step field): every task carries them, unless the value is empty or "none".
+MAESTRO_ATTRS = (("actor", "actor"), ("dispatchWorkflow", "dispatch_workflow"), ("doneWhen", "done_when"),
+                 ("gateOwner", "gate_owner"), ("repeat", "repeat"), ("phase", "phase"))
+
+# Diagram geometry in BPMN pixels: fixed shape sizes, one cell per node along the flow.
+TASK_W, TASK_H = 100, 80
+EVENT_SIZE, GATEWAY_SIZE = 36, 50
+H_GAP = 60  # between two nodes
+SUBROW_H = 110  # height of a lane for one row of nodes; concurrent branch paths stack in sub-rows
+POOL_X, POOL_Y = 20, 20
+POOL_HEADER = 30  # the strip with the participant name; the lanes start right of it
+CELL_PAD = 40  # between the pool edge and the first or last node
+LOOP_STEP = 16  # between two loop routes, as LOOP_LANE does in the SVG
+LOOP_PAD = 24  # room left below the last lane's content for the loop routes
+GROUP_PAD = 12
+
+_XML_ILLEGAL = re.compile("[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+_JSON_ILLEGAL = re.compile("[\ud800-\udfff\ufffe\uffff]")
+
+
+def _x(value: Any) -> str:
+    """Text for XML 1.0: the characters the standard forbids are dropped."""
+    return _XML_ILLEGAL.sub("", "" if value is None else str(value))
+
+
+def _ncname(raw: str, index: int) -> str:
+    """A valid XML NCName from a step id: bad characters become "_", a bad first character gets the prefix "S_"."""
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", raw.strip())
+    if not name:
+        return f"S_{index}"
+    return name if re.match(r"[A-Za-z_]", name) else "S_" + name
+
+
+class _Ids:
+    """Unique element ids: a taken id gets the suffix _2, _3, ..."""
+
+    def __init__(self, reserved: list[str]) -> None:
+        self.used: set[str] = set(reserved)
+
+    def take(self, base: str) -> str:
+        eid, n = base, 2
+        while eid in self.used:
+            eid, n = f"{base}_{n}", n + 1
+        self.used.add(eid)
+        return eid
+
+
+def _el(parent: Element | None, tag: str, attrs: dict[str, str] | None = None, text: str | None = None) -> Element:
+    clean = {k: _x(v) for k, v in (attrs or {}).items()}
+    el = Element(tag, clean) if parent is None else SubElement(parent, tag, clean)
+    if text is not None:
+        el.text = _x(text)
+    return el
+
+
+def _actor(step: dict[str, Any]) -> str:
+    return step.get("actor") if step.get("actor") in ACTOR_LABELS else "maestro"  # type: ignore[return-value]
+
+
+def _placements(layout: Layout) -> Iterator[Placement]:
+    for block in layout.blocks:
+        if isinstance(block, StepBlock):
+            yield block.place
+        else:
+            for path in block.paths:
+                yield from path.steps
+
+
+@dataclass
+class _Node:
+    id: str
+    tag: str
+    lane: str
+    w: int
+    h: int
+    col: int  # offset along the flow
+    sub: int  # sub-row inside its lane
+    block: int | None  # index of the layout block it belongs to
+    label: str = ""  # drawn next to the shape (events)
+    x: int = 0
+    y: int = 0
+
+    @property
+    def cx(self) -> int:
+        return self.x + self.w // 2
+
+    @property
+    def cy(self) -> int:
+        return self.y + self.h // 2
+
+
+@dataclass
+class _Edge:
+    id: str
+    source: str
+    target: str
+    name: str = ""
+    route: int | None = None  # a way back (loop): its index, for its own track below the lanes
+
+
+class _Export:
+    """Builds the process elements and the geometry of one design."""
+
+    def __init__(self, workflow: Any, design: dict[str, Any], layout: Layout) -> None:
+        self.workflow, self.design, self.layout = workflow, design, layout
+        used = {_actor(s) for s in layout.steps}
+        self.lanes = [a for a in ACTOR_ORDER if a in used] or ["maestro"]
+        process_id = _ncname(f"Process_{getattr(workflow, 'id', None) or 1}", 1)
+        self.process_id = process_id
+        self.ids = _Ids(["Definitions_1", "Collaboration_1", "Participant_1", process_id, "Start", "End",
+                         "BPMNDiagram_1", "BPMNPlane_1", "LaneSet_1", "Category_1",
+                         *(f"Lane_{a}" for a in ACTOR_ORDER)])
+        self.step_id: dict[int, str] = {}  # id(step dict) -> element id
+        self.by_raw: dict[str, str] = {}  # the id written in the design -> element id
+        for i, s in enumerate(layout.steps, 1):
+            raw = str(s.get("id") or "").strip()
+            self.step_id[id(s)] = self.ids.take(_ncname(raw, i))
+            self.by_raw.setdefault(raw, self.step_id[id(s)])
+        self.nodes: dict[str, _Node] = {}
+        self.elements: list[Element] = []  # flow nodes, in creation order
+        self.edges: list[_Edge] = []
+        self.backs: list[tuple[str, str, str]] = []  # (loop gateway, step it goes back to, flow name)
+        self.pending: list[tuple[str, str]] = []  # (node, flow name) the next node is connected from
+        self.col = 0
+        self.block: int | None = None
+        self.rank: dict[str, int] = {}  # lane -> sub-row, for the nodes of the branch path being built
+        # Filled by measure():
+        self.lane_box: dict[str, tuple[int, int, int, int]] = {}
+        self.pool = (POOL_X, POOL_Y, 0, 0)
+        self.route_y = 0
+
+    # --- Nodes and flows
+
+    def node(self, el: Element, nid: str, lane: str, w: int, h: int, label: str = "") -> None:
+        tag = el.tag[len(MODEL):]
+        self.nodes[nid] = _Node(nid, tag, lane, w, h, self.col, self.rank.get(lane, 0), self.block, label)
+        self.elements.append(el)
+        self.col += w + H_GAP
+
+    def link(self, source: str, target: str, name: str = "") -> None:
+        self.edges.append(_Edge(self.ids.take(f"Flow_{source}_{target}"), source, target, name))
+
+    def connect(self, target: str) -> None:
+        for source, name in self.pending:
+            self.link(source, target, name)
+        self.pending = []
+
+    def task(self, s: dict[str, Any], sid: str, actor: str) -> Element:
+        attrs = {"id": sid, "name": str(s.get("title") or "")}
+        dispatch = str(s.get("dispatch_workflow") or "").strip()
+        if actor == "dispatch" and dispatch not in ("", "none"):
+            attrs["calledElement"] = dispatch
+        for attr, key in MAESTRO_ATTRS:
+            value = str(s.get(key) or "").strip()
+            if value and value != "none":
+                attrs[MAESTRO + attr] = value
+        el = _el(None, MODEL + TASK_TAGS.get(actor, "serviceTask"), attrs)
+        # The first documentation line is the detail; the other lines only repeat what the attributes say.
+        detail = str(s.get("detail") or "").strip()
+        extras = []
+        if actor == "human" and str(s.get("gate_owner") or "").strip():
+            extras.append(f"Gate owner: {str(s['gate_owner']).strip()}")
+        if actor == "dispatch" and dispatch in DISPATCH_LABELS:
+            extras.append(f"Dispatch workflow: {DISPATCH_LABELS[dispatch]}")
+        repeat = tag_text(s.get("repeat"))
+        if repeat:
+            extras.append(f"Repeat: {repeat}")
+        if detail:
+            _el(el, MODEL + "documentation", text="\n".join([detail, *extras]))
+        elif extras:  # an empty first documentation keeps "detail" empty when the file is imported again
+            _el(el, MODEL + "documentation")
+            _el(el, MODEL + "documentation", text="\n".join(extras))
+        if repeat:
+            multi = _el(el, MODEL + "multiInstanceLoopCharacteristics", {"isSequential": "true"})
+            _el(multi, MODEL + "documentation", text=repeat)
+        return el
+
+    def add_step(self, p: Placement) -> None:
+        """The step, then its done event and its loop gateway when it has them."""
+        s, sid, lane = p.step, self.step_id[id(p.step)], p.actor
+        self.node(self.task(s, sid, p.actor), sid, lane, TASK_W, TASK_H)
+        self.connect(sid)
+        last, flow = sid, ""
+        done = str(s.get("done_when") or "").strip()
+        if done in DONE_LABELS:
+            did = self.ids.take(f"{sid}_done")
+            label = "Done when " + DONE_LABELS[done]
+            event = _el(None, MODEL + "intermediateCatchEvent", {"id": did, "name": label})
+            definition = _el(event, MODEL + "conditionalEventDefinition")
+            _el(definition, MODEL + "condition", {XSI + "type": "bpmn:tFormalExpression"}, DONE_LABELS[done])
+            self.node(event, did, lane, EVENT_SIZE, EVENT_SIZE, label)
+            self.link(last, did)
+            last = did
+        loop_to = str(s.get("loop_to") or "").strip()
+        if loop_to in self.by_raw:
+            gid = self.ids.take(f"{sid}_loop")
+            self.node(_el(None, MODEL + "exclusiveGateway", {"id": gid}), gid, lane, GATEWAY_SIZE, GATEWAY_SIZE)
+            self.link(last, gid)
+            loop = str(s.get("loop") or "").strip()
+            self.backs.append((gid, self.by_raw[loop_to], f"No · {loop}".strip()))
+            last, flow = gid, "Yes"
+        self.pending = [(last, flow)]
+
+    @staticmethod
+    def path_ranks(block: BranchBlock) -> list[dict[str, int]]:
+        """Paths that use the same lane go in different sub-rows of it."""
+        seen: dict[str, int] = {}
+        ranks = []
+        for path in block.paths:
+            lanes = {p.actor for p in path.steps}
+            ranks.append({lane: seen.get(lane, 0) for lane in lanes})
+            for lane in lanes:
+                seen[lane] = seen.get(lane, 0) + 1
+        return ranks
+
+    def build(self, cron: str) -> None:
+        steps = self.layout.steps
+        first_lane = _actor(steps[0]) if steps else self.lanes[0]
+        last_lane = _actor(steps[-1]) if steps else self.lanes[0]
+        start = _el(None, MODEL + "startEvent", {"id": "Start"})
+        if cron:
+            timer = _el(start, MODEL + "timerEventDefinition")
+            _el(timer, MODEL + "timeCycle", {XSI + "type": "bpmn:tFormalExpression"}, cron)
+        self.node(start, "Start", first_lane, EVENT_SIZE, EVENT_SIZE)
+        self.pending = [("Start", "")]
+        decider = ("Start", first_lane)  # what a branch block hangs off: the step before it, else Start
+        for block in self.layout.blocks:
+            self.block = block.index
+            if isinstance(block, StepBlock):
+                self.add_step(block.place)
+                decider = (self.step_id[id(block.place.step)], block.place.actor)
+                continue
+            base, lane = decider
+            split = self.ids.take(f"{base}_split")
+            self.node(_el(None, MODEL + "exclusiveGateway", {"id": split}), split, lane, GATEWAY_SIZE, GATEWAY_SIZE)
+            self.connect(split)
+            start_col, ends, tails = self.col, [], []
+            for path, rank in zip(block.paths, self.path_ranks(block)):
+                self.col, self.rank = start_col, rank
+                self.pending = [(split, path.label)]
+                for p in path.steps:
+                    self.add_step(p)
+                tails += self.pending
+                ends.append(self.col)
+            self.rank, self.col = {}, max(ends)
+            join = self.ids.take(f"{base}_join")
+            self.node(_el(None, MODEL + "exclusiveGateway", {"id": join}), join, lane, GATEWAY_SIZE, GATEWAY_SIZE)
+            self.pending = tails
+            self.connect(join)
+            self.pending = [(join, "")]
+        self.block = None
+        self.node(_el(None, MODEL + "endEvent", {"id": "End"}), "End", last_lane, EVENT_SIZE, EVENT_SIZE)
+        self.connect("End")
+        for k, (gid, target, name) in enumerate(self.backs):  # after the forward flows: "Yes" comes first
+            self.edges.append(_Edge(self.ids.take(f"Flow_{gid}_{target}"), gid, target, name, route=k))
+
+    # --- Geometry
+
+    def measure(self) -> None:
+        rows = {lane: 1 for lane in self.lanes}
+        for n in self.nodes.values():
+            rows[n.lane] = max(rows[n.lane], n.sub + 1)
+        heights = {lane: rows[lane] * SUBROW_H for lane in self.lanes}
+        content_bottom = POOL_Y + sum(heights.values())
+        self.route_y = content_bottom + LOOP_STEP  # the first way back runs here, the others below it
+        if self.backs:
+            heights[self.lanes[-1]] += LOOP_PAD + LOOP_STEP * len(self.backs)
+        left = POOL_X + POOL_HEADER
+        origin = left + CELL_PAD
+        for n in self.nodes.values():
+            n.x = origin + n.col
+        right = max(n.x + n.w for n in self.nodes.values()) + CELL_PAD
+        top = POOL_Y
+        for lane in self.lanes:
+            self.lane_box[lane] = (left, top, right - left, heights[lane])
+            top += heights[lane]
+        self.pool = (POOL_X, POOL_Y, right - POOL_X, top - POOL_Y)
+        for n in self.nodes.values():
+            _, lane_top, _, _ = self.lane_box[n.lane]
+            n.y = lane_top + n.sub * SUBROW_H + (SUBROW_H - n.h) // 2
+
+    def waypoints(self, e: _Edge) -> list[tuple[int, int]]:
+        """Orthogonal path of a flow: a line, or horizontal-vertical-horizontal; a way back runs under the lanes."""
+        src, dst = self.nodes[e.source], self.nodes[e.target]
+        if e.route is not None:
+            ry = self.route_y + LOOP_STEP * e.route
+            return [(src.cx, src.y + src.h), (src.cx, ry), (dst.cx, ry), (dst.cx, dst.y + dst.h)]
+        x1, y1, x2, y2 = src.x + src.w, src.cy, dst.x, dst.cy
+        if y1 == y2:
+            return [(x1, y1), (x2, y2)]
+        mid = (x1 + x2) // 2
+        return [(x1, y1), (mid, y1), (mid, y2), (x2, y2)]
+
+    def groups(self, bands: list[PhaseBand]) -> list[tuple[int, int, int]]:
+        """(band index, left, right) of each phase run: from its first to its last node along the flow."""
+        out = []
+        for i, band in enumerate(bands):
+            stop = bands[i + 1].block if i + 1 < len(bands) else None
+            members = [n for n in self.nodes.values()
+                       if n.block is not None and n.block >= band.block and (stop is None or n.block < stop)]
+            if members:
+                out.append((i, min(n.x for n in members) - GROUP_PAD, max(n.x + n.w for n in members) + GROUP_PAD))
+        return out
+
+
+def _bounds(parent: Element, x: int, y: int, w: int, h: int) -> None:
+    _el(parent, DC + "Bounds", {"x": str(x), "y": str(y), "width": str(w), "height": str(h)})
+
+
+def _label_width(text: str) -> int:
+    return min(160, max(24, int(len(text) * 6.5) + 8))
+
+
+def _shape(plane: Element, ref: str, x: int, y: int, w: int, h: int, *, horizontal: bool = False, marker: bool = False,
+           label: tuple[int, int, int, int] | None = None) -> None:
+    attrs = {"id": f"{ref}_di", "bpmnElement": ref}
+    if horizontal:
+        attrs["isHorizontal"] = "true"
+    if marker:
+        attrs["isMarkerVisible"] = "true"
+    shape = _el(plane, BPMNDI + "BPMNShape", attrs)
+    _bounds(shape, x, y, w, h)
+    if label:
+        _bounds(_el(shape, BPMNDI + "BPMNLabel"), *label)
+
+
+def _cdata(text: str) -> str:
+    return "<![CDATA[" + text.replace("]]>", "]]]]><![CDATA[>") + "]]>"
+
+
+def design_to_bpmn(workflow: Any, design: dict[str, Any], *, now: datetime | None = None) -> str:
+    """BPMN 2.0 file (with diagram interchange) of a stored design. Deterministic for a given `now`.
+
+    `workflow` supplies id, name, description and schedule_cron. Elements are built with ElementTree only.
+    """
+    for prefix, ns in (("bpmn", MODEL_NS), ("bpmndi", BPMNDI_NS), ("dc", DC_NS), ("di", DI_NS),
+                       ("maestro", MAESTRO_NS), ("xsi", XSI_NS)):
+        register_namespace(prefix, ns)
+    stamp = now or datetime.now(UTC)
+    stamp = stamp.replace(tzinfo=UTC) if stamp.tzinfo is None else stamp.astimezone(UTC)
+    name = str(getattr(workflow, "name", "") or "").strip() or "Maestro workflow"
+    description = str(getattr(workflow, "description", "") or "")
+    # The database keeps the orchestration prompt in the workflow's content, apart from the design JSON.
+    prompt = str(getattr(workflow, "content", "") or "").strip() or design.get("orchestration_prompt")
+    if prompt:
+        design = {**design, "orchestration_prompt": prompt}
+    schedule = design.get("schedule")
+    cron = (str(getattr(workflow, "schedule_cron", "") or "").strip()
+            or (str(schedule.get("cron") or "").strip() if isinstance(schedule, dict) else ""))
+
+    layout = compute_layout(design)
+    ex = _Export(workflow, design, layout)
+    ex.build(cron)
+    ex.measure()
+
+    defs = _el(None, MODEL + "definitions", {"id": "Definitions_1", "targetNamespace": MAESTRO_NS + "/export",
+                                             "exporter": "Upsun Maestro", "exporterVersion": EXPORT_VERSION})
+    bands = layout.bands
+    group_ids: list[str] = []
+    values: dict[str, str] = {}  # phase -> categoryValue id
+    if bands:
+        category = _el(defs, MODEL + "category", {"id": "Category_1", "name": "Phases"})
+        for band in bands:
+            if band.phase not in values:
+                values[band.phase] = ex.ids.take(f"CategoryValue_{len(values) + 1}")
+                _el(category, MODEL + "categoryValue", {"id": values[band.phase], "value": band.phase})
+        group_ids = [ex.ids.take(f"Group_{i}") for i in range(1, len(bands) + 1)]
+    collaboration = _el(defs, MODEL + "collaboration", {"id": "Collaboration_1"})
+    _el(collaboration, MODEL + "participant", {"id": "Participant_1", "name": name, "processRef": ex.process_id})
+
+    process = _el(defs, MODEL + "process", {"id": ex.process_id, "name": name, "isExecutable": "false"})
+    if description:
+        _el(process, MODEL + "documentation", text=description)
+    extension = _el(process, MODEL + "extensionElements")
+    stored = _el(extension, MAESTRO + "design", {"version": EXPORT_VERSION,
+                                                 "stepsHash": steps_hash(design.get("steps") or [])})
+    _el(extension, MAESTRO + "exported", {"at": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"), "app": "maestro"})
+    payload = json.dumps({"name": name, "description": description, "design": design}, ensure_ascii=False,
+                         default=str)
+    payload = _JSON_ILLEGAL.sub(lambda m: f"\\u{ord(m.group()):04x}", payload)
+
+    lane_set = _el(process, MODEL + "laneSet", {"id": "LaneSet_1"})
+    for lane in ex.lanes:
+        el = _el(lane_set, MODEL + "lane", {"id": f"Lane_{lane}", "name": ACTOR_LABELS[lane]})
+        for n in ex.nodes.values():
+            if n.lane == lane:
+                _el(el, MODEL + "flowNodeRef", text=n.id)
+    process.extend(ex.elements)
+    for e in ex.edges:
+        attrs = {"id": e.id, "sourceRef": e.source, "targetRef": e.target}
+        if e.name:
+            attrs["name"] = e.name
+        _el(process, MODEL + "sequenceFlow", attrs)
+    groups = ex.groups(bands)
+    for i, _, _ in groups:
+        _el(process, MODEL + "group", {"id": group_ids[i], "categoryValueRef": values[bands[i].phase]})
+
+    # Diagram interchange: the participant and lanes first, then the nodes and flows, the groups on top.
+    diagram = _el(defs, BPMNDI + "BPMNDiagram", {"id": "BPMNDiagram_1"})
+    plane = _el(diagram, BPMNDI + "BPMNPlane", {"id": "BPMNPlane_1", "bpmnElement": "Collaboration_1"})
+    px, py, pw, ph = ex.pool
+    _shape(plane, "Participant_1", px, py, pw, ph, horizontal=True)
+    for lane in ex.lanes:
+        _shape(plane, f"Lane_{lane}", *ex.lane_box[lane], horizontal=True)
+    for n in ex.nodes.values():
+        label = None
+        if n.label:
+            w = _label_width(n.label)
+            label = (n.cx - w // 2, n.y + n.h + 4, w, 14)
+        _shape(plane, n.id, n.x, n.y, n.w, n.h, marker=n.tag == "exclusiveGateway", label=label)
+    for e in ex.edges:
+        edge = _el(plane, BPMNDI + "BPMNEdge", {"id": f"{e.id}_di", "bpmnElement": e.id})
+        points = ex.waypoints(e)
+        for x, y in points:
+            _el(edge, DI + "waypoint", {"x": str(x), "y": str(y)})
+        if e.name:
+            w = _label_width(e.name)
+            if e.route is not None:  # on the horizontal run under the lanes
+                lx, ly = (points[1][0] + points[2][0]) // 2 - w // 2, points[1][1] - 18
+            else:  # above the horizontal run that enters the target
+                lx, ly = (points[-2][0] + 4 if len(points) > 2 else points[0][0] + 4), points[-1][1] - 18
+            _bounds(_el(edge, BPMNDI + "BPMNLabel"), lx, ly, w, 14)
+    for i, left, right in groups:
+        _shape(plane, group_ids[i], left, py, right - left, ph)
+
+    indent(defs, space="  ")
+    token = "MAESTRO-CDATA"
+    while True:  # ElementTree cannot write CDATA: a token that occurs nowhere else marks the place
+        stored.text = token
+        xml = tostring(defs, encoding="unicode")
+        if xml.count(token) == 1:
+            break
+        token += "X"
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml.replace(token, _cdata(payload))

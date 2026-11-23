@@ -14,7 +14,7 @@ from app.anthropic_client import ManagedAgentsError
 from app.db import get_db
 from app.deps import csrf_protect, require_configured
 from app.maestro import service
-from app.maestro.bpmn import MAX_BYTES, BpmnImportError, ImportResult, bpmn_to_design
+from app.maestro.bpmn import MAX_BYTES, BpmnImportError, ImportResult, bpmn_to_design, design_to_bpmn
 from app.maestro.diagram import DIAGRAM_ONLY_DESCRIPTION, PDF_MAX_BYTES
 from app.maestro.diagram import validate as validate_diagram
 from app.maestro.render import render_design_svg, step_info
@@ -270,14 +270,30 @@ async def design_config(
     return RedirectResponse(f"/workflows/{wf.id}/design#config", status_code=303)
 
 
+def _download_name(wf: Workflow) -> str:
+    """File name (without extension) of the downloads of a design: maestro-<name as a slug>."""
+    return "maestro-" + (re.sub(r"[^a-z0-9]+", "-", wf.name.lower()).strip("-") or "workflow")
+
+
 @router.get("/workflows/{workflow_id}/design.svg")
 def design_svg(workflow_id: int, user: User = Depends(require_configured), db: Session = Depends(get_db)) -> Response:
     wf = _maestro(db, workflow_id, user, view=True)
     if wf.design_status != "ready" or not wf.design_json:
         raise HTTPException(status_code=404)
-    slug = re.sub(r"[^a-z0-9]+", "-", wf.name.lower()).strip("-") or "workflow"
     return Response(
         '<?xml version="1.0" encoding="UTF-8"?>\n' + str(render_design_svg(wf.design_json)),
         media_type="image/svg+xml",
-        headers={"Content-Disposition": f'attachment; filename="maestro-{slug}.svg"'},
+        headers={"Content-Disposition": f'attachment; filename="{_download_name(wf)}.svg"'},
+    )
+
+
+@router.get("/workflows/{workflow_id}/design.bpmn")
+def design_bpmn(workflow_id: int, user: User = Depends(require_configured), db: Session = Depends(get_db)) -> Response:
+    wf = _maestro(db, workflow_id, user, view=True)
+    if wf.design_status != "ready" or not wf.design_json:
+        raise HTTPException(status_code=404)
+    return Response(
+        design_to_bpmn(wf, wf.design_json),
+        media_type="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{_download_name(wf)}.bpmn"'},
     )
