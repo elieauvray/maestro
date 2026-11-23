@@ -66,12 +66,13 @@ lives in a "ledger" (an edited comment) on each tracked item.
 
 1. [Architecture](#architecture)
 2. [BPMN 2.0 import](#bpmn-20-import)
-3. [Local setup](#local-setup)
-4. [Deploying on Upsun](#deploying-on-upsun)
-5. [Connector configuration](#connector-configuration)
-6. [Security](#security)
-7. [Tests](#tests)
-8. [Known limitations](#known-limitations)
+3. [BPMN 2.0 export](#bpmn-20-export)
+4. [Local setup](#local-setup)
+5. [Deploying on Upsun](#deploying-on-upsun)
+6. [Connector configuration](#connector-configuration)
+7. [Security](#security)
+8. [Tests](#tests)
+9. [Known limitations](#known-limitations)
 
 ## Architecture
 
@@ -218,6 +219,48 @@ intermediate and end events. A file written by Maestro also carries its design i
 - data objects and data stores (and their references);
 - script and business rule tasks;
 - signal and escalation events.
+
+## BPMN 2.0 export
+
+The design page has a **Download BPMN** button next to *Download SVG*: `GET /workflows/{id}/design.bpmn` returns the
+design as a BPMN 2.0 file with diagram interchange (DI), named `maestro-<project>.bpmn`. It opens in bpmn.io, Camunda
+Modeler, Signavio and Bizagi with the lanes, tasks, gateways and flows laid out. Access is the same as for
+`design.svg` (the owner, or anyone who can view a shared project; a design that is not ready gives a 404).
+
+**An exchange and governance format, not an execution format.** Maestro is not a BPMN engine: the process has
+`isExecutable="false"`. No LLM writes the XML and there is no Anthropic call: the file is a deterministic conversion of
+the stored design (`design_to_bpmn()` in `app/maestro/bpmn.py`, built with the standard library's `ElementTree`).
+
+| Maestro | BPMN 2.0 |
+|---|---|
+| Project | a `collaboration` with one `participant` and its `process` |
+| Actor | one horizontal `lane` per actor used, in the SVG order (People, Maestro, Upsun Dispatch, Upsun Cloud, Other systems) |
+| Person (`human`) | `userTask`; the gate owner is in the documentation and in `maestro:gateOwner` |
+| Maestro, Upsun Cloud | `serviceTask` |
+| Dispatch | `callActivity` with `calledElement` set to the Dispatch workflow (`issue_to_code`, `code_review`, `full_review`, `cve_scan`) |
+| Other systems | `task` |
+| Completion signal (`done_when`) | after the step, an `intermediateCatchEvent` with a conditional event ("PR merged", "PR approved", "issue closed", "PR opened") |
+| Branches | an exclusive gateway after the deciding step (`<step>_split`), one flow per path named after its label, and a join (`<step>_join`) |
+| Loop back (`loop_to`) | an exclusive gateway after the step (`<step>_loop`): "Yes" goes on, "No · <condition>" goes back to the step, under the lanes |
+| Repeat | `multiInstanceLoopCharacteristics` (sequential) on the task, with the text in its documentation and in `maestro:repeat` |
+| Phase | a `group` per phase band (as in the SVG) with a `categoryValue`, and `maestro:phase` on each task |
+| Schedule | a timer start event whose `timeCycle` is the cron, when the project has one; otherwise a plain start event |
+
+Task ids are the step ids (made valid XML names when needed: `3a` becomes `S_3a`); the generated elements have stable
+ids (`Start`, `End`, `S2_done`, `S2_loop`, `S5_split`, `S5_join`, `Flow_<source>_<target>`, `Lane_<actor>`...). The
+first line of a task's documentation is its detail.
+
+**Restoring the design.** The process `extensionElements` hold `<maestro:design version="1" stepsHash="...">` with the
+whole design (name, description, steps, settings, orchestration prompt) as JSON in a CDATA block, and
+`<maestro:exported at="..." app="maestro"/>`. The `maestro:` namespace is `https://upsun.com/schema/maestro/1`.
+Importing the file again, unchanged, restores the design as is (see *BPMN 2.0 import*). A step id that had to be
+changed, a detail with several lines, a branch with a single path or a loop that goes back into a branch path
+cannot be rebuilt exactly from the BPMN elements: such a file goes through the import review instead.
+
+**Diagram.** `compute_layout()` in `app/maestro/render.py` is the one place that decides the order of the steps, the
+phase bands, the branch paths and the loops. The SVG draws from it (its output is unchanged) and the BPMN diagram uses
+the same structure in BPMN units: lanes are horizontal bands, a node's x follows the flow, the paths of a branch stack
+in sub-rows of their lane, and loop routes run under the last lane. Shapes have the usual BPMN sizes.
 
 ## Local setup
 
@@ -414,6 +457,7 @@ TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/dispatch_test pytest -q
 ## Known limitations
 
 - **BPMN import**: a Maestro file is restored as is only when its steps are unchanged; any edit sends it through the review. The routes chosen in the review are not written back to a BPMN file (the next export reflects the new design), and there is no in-app BPMN editor.
+- **BPMN export**: the file is meant for exchange and governance, not for execution (`isExecutable="false"`). The layout is computed, not hand-drawn: very large designs with many parallel branch paths or loops give tall lanes, and there is no XSD validation in the tests: check a new kind of design by opening the file in a BPMN tool.
 - **Question detection**: heuristic, the last line of Claude's message must end with "?". In any case, the user can continue the conversation.
 - **Atlassian with a static token**: personal API tokens (Basic `email:token`) are not compatible with `static_bearer`. Use OAuth or a service account key.
 - **The "Test" button** cannot redo the authenticated handshake for a static token, since the token is not kept. It checks the credential on the vault side and that the server is reachable. The full handshake happens when saving.

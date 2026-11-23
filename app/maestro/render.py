@@ -6,6 +6,7 @@ so the exported file renders the same outside the app.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from html import escape
 from typing import Any
 
@@ -162,7 +163,104 @@ def _pill_w(label: str) -> float:
     return max(len(label) * 6.3 + 18, 34)
 
 
-def render_design_svg(design: dict[str, Any]) -> Markup:
+# --- Layout: where everything sits, computed once for the SVG and the BPMN diagram -------------------------
+
+
+Tail = tuple[float, float, str]  # (x, bottom, step id): where an arrow to the next thing leaves from
+
+
+@dataclass
+class Placement:
+    """Where one step sits (SVG units)."""
+
+    id: str
+    step: dict[str, Any]
+    actor: str  # the actor whose column and style it gets; an unknown actor counts as "maestro"
+    x: float
+    y: float
+    w: float
+    block: int  # index in Layout.blocks
+    path: int | None  # index of its branch path, None for a main step
+    row: int  # position in its path (0 for a main step)
+    end: float  # where the next thing may start (below its "Yes" label if it has one)
+    yes: bool  # a "Yes" label sits below it
+
+
+@dataclass
+class PhaseBand:
+    y: float
+    phase: str
+    first: str  # id of the first step under the band
+    last: str  # id of the last step before the next band (or of the whole design)
+    block: int
+
+
+@dataclass
+class PathLayout:
+    label: str
+    lx: float  # left edge of the path's lane
+    lane: float  # width of the lane
+    x: float
+    cx: float
+    w: float
+    steps: list[Placement]
+
+
+@dataclass
+class StepBlock:
+    index: int
+    place: Placement
+    tails: list[Tail]  # arrows that end at this step
+    band: PhaseBand | None  # the phase band drawn right above it
+
+
+@dataclass
+class BranchBlock:
+    index: int
+    fork_y: float
+    pill_cy: float
+    first_top: float
+    fork_x: float | None  # where the deciding step's arrow leaves; None when the block opens the design
+    tails: list[Tail]  # arrows that end at the paths
+    paths: list[PathLayout]
+    frame_top: float
+    frame_h: float
+    bottom: float
+
+
+@dataclass
+class LoopRoute:
+    index: int
+    source: Placement
+    target: Placement
+    gx: float  # x of the vertical run, in the right margin
+    y1: float
+    y2: float
+    label: str | None  # the condition shown in the margin (None: no pill)
+
+
+@dataclass
+class Layout:
+    steps: list[dict[str, Any]]
+    used: list[str]
+    col_w: float
+    box_w: float
+    col_x: dict[str, float]
+    width: int
+    gutter: float
+    label_w: float
+    loop_ids: set[str]
+    blocks: list[StepBlock | BranchBlock] = field(default_factory=list)
+    bands: list[PhaseBand] = field(default_factory=list)
+    loops: list[LoopRoute] = field(default_factory=list)
+    placements: dict[str, Placement] = field(default_factory=dict)
+    cursor: float = 0.0  # bottom of what was drawn last
+    height: float = 0.0
+    total_w: float = 0.0
+
+
+def compute_layout(design: dict[str, Any]) -> Layout:
+    """Positions of the swimlane diagram: columns per actor, rows, phase bands, branch paths and loop routes."""
     steps: list[dict[str, Any]] = design.get("steps") or []
     ids = {str(s.get("id", "")) for s in steps}
     loops = [s for s in steps if s.get("loop_to") and s.get("loop_to") in ids]
@@ -177,11 +275,105 @@ def render_design_svg(design: dict[str, Any]) -> Markup:
     col_w = (width - LABEL_W) / len(used)
     box_w = col_w - 20
     col_x = {a: LABEL_W + i * col_w for i, a in enumerate(used)}
+    layout = Layout(steps, used, col_w, box_w, col_x, width, gutter, label_w, loop_ids)
+
+    last_id = str(steps[-1].get("id")) if steps else ""
+    last_seen = ""
+
+    def place(s: dict[str, Any], x: float, y: float, w: float, block: int, path: int | None, row: int) -> Placement:
+        nonlocal last_seen
+        sid = str(s.get("id", ""))
+        actor = s.get("actor") if s.get("actor") in ACTOR_STYLE else "maestro"
+        yes = sid in loop_ids and sid != last_id
+        bottom = y + ROW_H
+        p = Placement(sid, s, actor, x, y, w, block, path, row, bottom + YES_ROOM if yes else bottom, yes)
+        layout.placements[sid] = p
+        last_seen = sid
+        return p
+
+    cursor = float(TOP - 12)  # bottom of what was drawn last
+    tails: list[Tail] = []
+    current_phase = None
+    for index, (kind, block) in enumerate(_blocks(steps)):
+        if kind == "step":
+            s = block
+            phase = s.get("phase") or ""
+            top = cursor + STEP_GAP
+            band = None
+            if phase and phase != current_phase:
+                current_phase = phase
+                band_y = cursor + 12
+                band = PhaseBand(band_y, phase, str(s.get("id", "")), str(s.get("id", "")), index)
+                if layout.bands:
+                    layout.bands[-1].last = last_seen
+                layout.bands.append(band)
+                top = band_y + BAND_H - 6 + ARROW_RUN + 22
+            actor = s.get("actor") if s.get("actor") in ACTOR_STYLE else "maestro"
+            x = col_x.get(actor, col_x[used[0]]) + 10
+            cx = x + box_w / 2
+            p = place(s, x, top, box_w, index, None, 0)
+            layout.blocks.append(StepBlock(index, p, list(tails), band))
+            cursor = p.end
+            tails = [(cx, top + ROW_H, p.id)]
+            continue
+
+        # Alternative paths, side by side, each under a labeled arrow from the deciding step.
+        paths: dict[str, list[dict[str, Any]]] = block
+        n = len(paths)
+        lane = (width - 20) / n
+        path_w = min(box_w, lane - 20) if n > 1 else box_w
+        fork_y = cursor + 18
+        pill_cy = fork_y + 34
+        first_top = pill_cy + PILL_H / 2 + ARROW_RUN + 4
+        block_bottom = first_top
+        new_tails: list[Tail] = []
+        path_layouts: list[PathLayout] = []
+        for i, (label, path_steps) in enumerate(paths.items()):
+            lx = 10 + i * lane
+            x = lx + (lane - path_w) / 2
+            cx = x + path_w / 2
+            py = end = first_top
+            placed: list[Placement] = []
+            for k, s in enumerate(path_steps):
+                p = place(s, x, py, path_w, index, i, k)
+                placed.append(p)
+                end = p.end
+                if k + 1 < len(path_steps):
+                    py = end + STEP_GAP
+            new_tails.append((cx, py + ROW_H, placed[-1].id))
+            block_bottom = max(block_bottom, end)
+            path_layouts.append(PathLayout(label, lx, lane, x, cx, path_w, placed))
+        layout.blocks.append(BranchBlock(index, fork_y, pill_cy, first_top, tails[0][0] if tails else None,
+                                         list(tails), path_layouts, fork_y + 12, block_bottom - fork_y + 4,
+                                         block_bottom))
+        tails = new_tails
+        cursor = block_bottom + 16
+    if layout.bands:
+        layout.bands[-1].last = last_seen
+
+    # Loops back: dashed arrow from the step to the earlier one through the right margin, labeled "No · ...".
+    for i, s in enumerate(loops):
+        src, dst = layout.placements.get(str(s.get("id"))), layout.placements.get(str(s.get("loop_to")))
+        if not src or not dst:
+            continue
+        gx = width + NO_ROOM + label_w + 24 + i * LOOP_LANE
+        y1, y2 = src.y + ROW_H / 2, dst.y + ROW_H / 2 - 8
+        layout.loops.append(LoopRoute(i, src, dst, gx, y1, y2, labels.get(str(s.get("id")))))
+
+    layout.cursor = cursor
+    layout.height = cursor + 16
+    layout.total_w = width + gutter
+    return layout
+
+
+def render_design_svg(design: dict[str, Any]) -> Markup:
+    layout = compute_layout(design)
+    used, col_x, col_w, box_w = layout.used, layout.col_x, layout.col_w, layout.box_w
+    width, loop_ids = layout.width, layout.loop_ids
 
     parts: list[str] = []
     overlays: list[str] = []  # drawn last: labels sitting on arrows
     arrows: list[str] = []
-    boxes: dict[str, tuple[float, float, float]] = {}  # id -> (x, y, w)
 
     for a in used:
         fill, op, stroke, tcolor = ACTOR_STYLE[a]
@@ -210,10 +402,10 @@ def render_design_svg(design: dict[str, Any]) -> Markup:
         else:
             arrow(f"M{x1:.1f} {b1:.1f} L{x1:.1f} {turn:.1f} L{x2:.1f} {turn:.1f} L{x2:.1f} {t2 - 3:.1f}", color=color)
 
-    def draw_step(s: dict[str, Any], x: float, y: float, w: float, show_actor: bool) -> float:
-        """Draws the step; returns where the next thing may start (below its "Yes" label if any)."""
-        actor = s.get("actor") if s.get("actor") in ACTOR_STYLE else "maestro"
-        fill, op, stroke, tcolor = ACTOR_STYLE[actor]
+    def draw_step(p: Placement) -> None:
+        s, x, y, w = p.step, p.x, p.y, p.w
+        fill, op, stroke, tcolor = ACTOR_STYLE[p.actor]
+        actor = p.actor
         chars = int(w / 6.9)
         cx = x + w / 2
         parts.append(f'<g class="ms-step" data-step="{escape(str(s.get("id", "")))}">' + _tooltip(s))
@@ -227,7 +419,7 @@ def render_design_svg(design: dict[str, Any]) -> Markup:
         )
         sub = MUTED if actor != "human" else NEUTRAL_1000
         tags = step_tags({**s, "actor": actor}, with_loop=False)
-        if show_actor and actor != "human":  # inside a path the column no longer says who does it
+        if p.path is not None and actor != "human":  # inside a path the column no longer says who does it
             tags = [ACTOR_LABELS[actor], *tags]
         parts.append(_t(x + 10, y + 14, _clip(f"{s.get('id', '')} " + " · ".join(tags), chars + 4), size=10,
                         fill=sub, anchor="start"))
@@ -235,14 +427,9 @@ def render_design_svg(design: dict[str, Any]) -> Markup:
         if s.get("detail"):
             parts.append(_t(cx, y + 53, _clip(s["detail"], chars), size=11, fill=sub))
         parts.append("</g>")
-        sid = str(s.get("id", ""))
-        boxes[sid] = (x, y, w)
-        bottom = y + ROW_H
-        if sid in loop_ids and sid != str(steps[-1].get("id")):
-            overlays.append(_pill(cx, bottom + 8 + PILL_H / 2, "Yes", fill=LIME, stroke=LIME,
+        if p.yes:
+            overlays.append(_pill(cx, y + ROW_H + 8 + PILL_H / 2, "Yes", fill=LIME, stroke=LIME,
                                   color=NEUTRAL_1000, size=10))
-            return bottom + YES_ROOM
-        return bottom
 
     def band(y: float, phase: str) -> None:
         parts.append(f'<rect x="0" y="{y}" width="{width}" height="{BAND_H - 6}" rx="4" fill="{BG}" '
@@ -250,95 +437,55 @@ def render_design_svg(design: dict[str, Any]) -> Markup:
         parts.append(_t(12, y + (BAND_H - 6) / 2, _clip(phase, 120), size=12, weight=700, fill=TEXT,
                         anchor="start"))
 
-    cursor = float(TOP - 12)  # bottom of what was drawn last
-    tails: list[tuple[float, float, str]] = []  # (cx, bottom, step id) arrows leave from
-    current_phase = None
-    for kind, block in _blocks(steps):
-        if kind == "step":
-            s = block
-            phase = s.get("phase") or ""
-            top = cursor + STEP_GAP
-            if phase and phase != current_phase:
-                current_phase = phase
-                band_y = cursor + 12
-                band(band_y, phase)
-                top = band_y + BAND_H - 6 + ARROW_RUN + 22
-            actor = s.get("actor") if s.get("actor") in ACTOR_STYLE else "maestro"
-            x = col_x.get(actor, col_x[used[0]]) + 10
-            cx = x + box_w / 2
-            for tx, tb, tsid in tails:  # one arrow, or several when paths join here
-                link(tx, tb, cx, top, top - ARROW_RUN, tsid)
-            cursor = draw_step(s, x, top, box_w, show_actor=False)
-            tails = [(cx, top + ROW_H, str(s.get("id", "")))]
+    for block in layout.blocks:
+        if isinstance(block, StepBlock):
+            p = block.place
+            if block.band:
+                band(block.band.y, block.band.phase)
+            cx = p.x + p.w / 2
+            for tx, tb, tsid in block.tails:  # one arrow, or several when paths join here
+                link(tx, tb, cx, p.y, p.y - ARROW_RUN, tsid)
+            draw_step(p)
             continue
 
-        # Alternative paths, side by side, each under a labeled arrow from the deciding step.
-        paths: dict[str, list[dict[str, Any]]] = block
-        n = len(paths)
-        lane = (width - 20) / n
-        path_w = min(box_w, lane - 20) if n > 1 else box_w
-        fork_y = cursor + 18
-        pill_cy = fork_y + 34
-        first_top = pill_cy + PILL_H / 2 + ARROW_RUN + 4
-        if tails:
-            fx = tails[0][0]
+        if block.fork_x is not None:
+            fx, fork_y = block.fork_x, block.fork_y
             overlays.append(
                 f'<path d="M{fx:.1f} {fork_y - 7:.1f} L{fx + 7:.1f} {fork_y:.1f} L{fx:.1f} {fork_y + 7:.1f} '
                 f'L{fx - 7:.1f} {fork_y:.1f} Z" fill="{SURFACE}" stroke="{ACCENT}" stroke-width="1.5"/>'
             )
-        block_bottom = first_top
-        new_tails: list[tuple[float, float, str]] = []
-        frames: list[tuple[float, float]] = []
-        for i, (label, path_steps) in enumerate(paths.items()):
-            lx = 10 + i * lane
-            x = lx + (lane - path_w) / 2
-            cx = x + path_w / 2
-            frames.append((lx, lane))
-            for tx, tb, tsid in tails:
-                link(tx, tb, cx, first_top, fork_y, tsid)
-            overlays.append(_pill(cx, pill_cy, label, fill=ACCENT, stroke=ACCENT,
+        for path in block.paths:
+            for tx, tb, tsid in block.tails:
+                link(tx, tb, path.cx, block.first_top, block.fork_y, tsid)
+            overlays.append(_pill(path.cx, block.pill_cy, path.label, fill=ACCENT, stroke=ACCENT,
                                   color="var(--accent-contrast, #FFFFFF)"))
-            py = end = prev_bottom = first_top
-            prev_id = ""
-            for k, s in enumerate(path_steps):
-                if k:
-                    arrow(f"M{cx:.1f} {prev_bottom:.1f} L{cx:.1f} {py - 3:.1f}", color=out_color(prev_id))
-                prev_id = str(s.get("id", ""))
-                end = draw_step(s, x, py, path_w, show_actor=True)
-                prev_bottom = py + ROW_H
-                if k + 1 < len(path_steps):
-                    py = end + STEP_GAP
-            new_tails.append((cx, py + ROW_H, str(path_steps[-1].get("id", ""))))
-            block_bottom = max(block_bottom, end)
-        if n > 1:
-            frame_top, frame_h = fork_y + 12, block_bottom - fork_y + 4
-            for lx, lw in frames:
-                parts.append(f'<rect x="{lx + 4:.1f}" y="{frame_top:.1f}" width="{lw - 8:.1f}" '
-                             f'height="{frame_h:.1f}" rx="10" fill="none" stroke="{BORDER}" stroke-dasharray="3 4"/>')
-        tails = new_tails
-        cursor = block_bottom + 16
+            prev: Placement | None = None
+            for p in path.steps:
+                if prev is not None:
+                    arrow(f"M{path.cx:.1f} {prev.y + ROW_H:.1f} L{path.cx:.1f} {p.y - 3:.1f}", color=out_color(prev.id))
+                draw_step(p)
+                prev = p
+        if len(block.paths) > 1:
+            for path in block.paths:
+                parts.append(f'<rect x="{path.lx + 4:.1f}" y="{block.frame_top:.1f}" width="{path.lane - 8:.1f}" '
+                             f'height="{block.frame_h:.1f}" rx="10" fill="none" stroke="{BORDER}" '
+                             f'stroke-dasharray="3 4"/>')
 
     # Loops back: dashed arrow from the step to the earlier one through the right margin, labeled "No · ...".
-    for i, s in enumerate(loops):
-        src, dst = boxes.get(str(s.get("id"))), boxes.get(str(s.get("loop_to")))
-        if not src or not dst:
-            continue
-        sx, sy, sw = src
-        dx, dy, dw = dst
-        gx = width + NO_ROOM + label_w + 24 + i * LOOP_LANE
-        y1, y2 = sy + ROW_H / 2, dy + ROW_H / 2 - 8
-        arrow(f"M{sx + sw:.1f} {y1:.1f} L{gx:.1f} {y1:.1f} L{gx:.1f} {y2:.1f} L{dx + dw + 3:.1f} {y2:.1f}",
-              dashed=True)
-        overlays.append(_pill(sx + sw + 24, y1, "No", fill=NO_RED, stroke=NO_RED, color=NEUTRAL_1000, size=10))
-        if str(s.get("id")) in labels:
-            overlays.append(_pill(width + NO_ROOM + 12 + label_w / 2, y1, labels[str(s.get("id"))], fill=SURFACE,
+    for route in layout.loops:
+        src, dst = route.source, route.target
+        arrow(f"M{src.x + src.w:.1f} {route.y1:.1f} L{route.gx:.1f} {route.y1:.1f} L{route.gx:.1f} {route.y2:.1f} "
+              f"L{dst.x + dst.w + 3:.1f} {route.y2:.1f}", dashed=True)
+        overlays.append(_pill(src.x + src.w + 24, route.y1, "No", fill=NO_RED, stroke=NO_RED, color=NEUTRAL_1000,
+                              size=10))
+        if route.label is not None:
+            overlays.append(_pill(width + NO_ROOM + 12 + layout.label_w / 2, route.y1, route.label, fill=SURFACE,
                                   stroke=ACCENT, color=TEXT, size=10, dashed=True))
 
-    height = cursor + 16
-    total_w = width + gutter
     summary = escape(design.get("summary") or "Maestro project")
     svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w:.0f} {height:.0f}" width="100%" role="img" '
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {layout.total_w:.0f} {layout.height:.0f}" '
+        f'width="100%" role="img" '
         f'aria-labelledby="ms-title ms-desc" class="maestro-diagram"><title id="ms-title">Maestro project'
         f'</title><desc id="ms-desc">{summary}</desc><defs><marker id="ms-arrow" viewBox="0 0 10 10" '
         f'refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path '
