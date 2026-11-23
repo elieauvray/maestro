@@ -1,5 +1,6 @@
 // A pasted or dropped image becomes the diagram file of the form (one diagram per workflow).
-// On the describe page a .bpmn file is imported instead: the form posts to /maestro/import-bpmn.
+// On the describe page a .bpmn file is imported instead: the form posts to /maestro/import-bpmn,
+// the preview shows a "BPMN: will be imported" badge and the submit button reads "Import the workflow".
 // Used on the describe and edit pages (see partials/diagram_input.html).
 (function () {
   var input = document.getElementById("diagram");
@@ -18,6 +19,9 @@
   var describeAction = form.getAttribute("action");
   var nameField = form.querySelector('input[name="name"]');
   var nameRequired = nameField ? nameField.required : false;
+  var badge = document.getElementById("diagram-badge");
+  var submitLabel = allowBpmn ? document.getElementById("submit-label") : null;
+  var submitText = submitLabel ? submitLabel.textContent : "";
 
   function isBpmn(file) { return allowBpmn && !!file && /\.bpmn$/i.test(file.name); }
 
@@ -29,6 +33,8 @@
     var bpmn = isBpmn(file);
     form.setAttribute("action", bpmn ? "/maestro/import-bpmn" : describeAction);
     if (nameField) nameField.required = bpmn ? false : nameRequired;  // the process name is used
+    if (badge) badge.hidden = !bpmn;
+    if (submitLabel) submitLabel.textContent = bpmn ? "Import the workflow" : submitText;
     if (!file) { preview.hidden = true; return; }
     if (!bpmn && file.type.indexOf("image/") === 0) {
       url = URL.createObjectURL(file);
@@ -38,7 +44,7 @@
       img.hidden = true;
     }
     nameEl.textContent = file.name + " · " + (file.size / 1e6).toFixed(2) + " MB"
-      + (bpmn ? " (BPMN import: the process name is used)" : current ? " (replaces the current diagram)" : "");
+      + (!bpmn && current ? " (replaces the current diagram)" : "");
     preview.hidden = false;
   }
   function use(file, name) {

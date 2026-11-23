@@ -3,8 +3,7 @@
 <div class="diagram-drop" id="diagram-drop"{% if allow_bpmn %} data-bpmn="1"{% endif %}>
   <label for="diagram" style="margin:0">
     <strong>Process diagram</strong> <span class="muted small">(optional)</span><br>
-    <span class="small muted">Paste an image into the description, drop a file here, or choose an image (PNG, JPEG, GIF, WebP, 3.75 MB max) or a PDF (10 MB max). Maestro reads it like a description; the text takes precedence.</span>{% if allow_bpmn %}
-    <br><span class="small muted">BPMN 2.0 files (.bpmn) from Maestro or any BPMN tool.</span>{% endif %}
+    <span class="small muted">Paste or drop an image (PNG, JPEG, GIF, WebP, 3.75 MB max) or a PDF (10 MB max): Maestro reads it like a description.{% if allow_bpmn %} A BPMN 2.0 file (.bpmn) is imported as a structured workflow instead.{% endif %}</span>
   </label>
   {% if current and current.diagram_media_type %}
   <div id="diagram-current" class="diagram-preview">
@@ -21,6 +20,7 @@
   <div id="diagram-preview" class="diagram-preview" hidden>
     <img id="diagram-img" alt="Project diagram preview">
     <span id="diagram-name" class="small"></span>
+    {% if allow_bpmn %}<span id="diagram-badge" class="badge maestro" hidden>BPMN: will be imported</span>{% endif %}
     <button type="button" class="secondary outline" id="diagram-remove">{{ icon('delete') }}Remove</button>
   </div>
 </div>

@@ -26,7 +26,7 @@ You can also paste an image of a process diagram here (Ctrl+V or Cmd+V).">{{ des
       acceptance environments. Maestro also lists what Dispatch cannot do today and the alternative it chose.
       You review the design, then run the project from Manage, where it is saved.
     </small>
-    <button type="submit">{{ icon('design') }}Design the project</button>
+    <button type="submit" id="describe-submit">{{ icon('design') }}<span id="submit-label">Design the project</span></button>
   </form>
 </article>
 <script src="{{ asset('diagram-input.js') }}"></script>
