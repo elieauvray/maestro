@@ -141,6 +141,7 @@ table { font-size: .92rem; }
 
 /* Statuts */
 .badge { display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .78rem; font-weight: 600; border: 1px solid var(--border); white-space: nowrap; }
+.badge[hidden] { display: none; }
 .badge.running { background: color-mix(in srgb, var(--u-blue-600) 22%, transparent); }
 .badge.waiting_input, .badge.waiting_approval { background: var(--u-lime-600); color: var(--u-neutral-1000); border-color: var(--u-lime-600); }
 .badge.completed, .badge.done, .badge.configured { background: color-mix(in srgb, var(--u-violet-600) 18%, transparent); }
@@ -173,8 +174,10 @@ table { font-size: .92rem; }
 .htmx-request .spinner, .spinner.htmx-request { display: inline-block; }
 .spinner { display: none; }
 .highlight { background: var(--u-lime-600); color: var(--u-neutral-1000); padding: 0 .25rem; border-radius: 3px; }
-.connector-head { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+.connector-head { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
 .connector-head h3 { margin: 0; }
+.head-actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+.head-actions a[role="button"] { margin: 0; width: auto; }
 textarea.big { min-height: 14rem; font-family: var(--pico-font-family); }
 .skill-content { white-space: pre-wrap; max-height: 8rem; overflow: auto; font-size: .85rem; }
 

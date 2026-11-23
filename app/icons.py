@@ -18,6 +18,7 @@ ICONS: dict[str, str] = {
     "edit": '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
     "delete": '<path d="M4 7h16M9 7V4h6v3M6.5 7l1 13h9l1-13M10 11v6M14 11v6"/>',
     "download": '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
+ "upload": '<path d="M12 15V4M7 9l5-5 5 5M5 20h14"/>',
     "refresh": '<path d="M20 12a8 8 0 1 1-2.4-5.7"/><path d="M20 4v5h-5"/>',
     "schedule": '<rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4"/>',
     "pause": '<path d="M9 5v14M15 5v14"/>',

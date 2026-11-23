@@ -109,10 +109,18 @@ def _in_import_review(wf: Workflow) -> bool:
     return wf.design_status == "needs_answers" and (wf.clarifications or {}).get("kind") == "import_review"
 
 
+@router.get("/maestro/import-bpmn")
+def maestro_import_bpmn_page(request: Request, user: User = Depends(require_configured)) -> Response:
+    return render(request, "maestro_import_bpmn.html", {"shared": False})
+
+
 @router.post("/maestro/import-bpmn", dependencies=[Depends(csrf_protect)])
 async def maestro_import_bpmn(
     request: Request,
     shared: str = Form(""),
+    origin: str = Form(""),
+    name: str = Form(""),
+    description: str = Form(""),
     diagram: UploadFile | None = File(None),
     user: User = Depends(require_configured),
     db: Session = Depends(get_db),
@@ -122,9 +130,13 @@ async def maestro_import_bpmn(
         wf = service.create_imported_workflow(db, user, result, shared=bool(shared))
     except (BpmnImportError, ManagedAgentsError) as exc:
         flash(request, str(exc), "error")
-        return RedirectResponse("/maestro/new", status_code=303)
+        # Fixed whitelist: errors go back to the page the form came from, never to a submitted URL.
+        return RedirectResponse("/maestro/import-bpmn" if origin == "import" else "/maestro/new", status_code=303)
     flash(request, "BPMN file imported." + (" Your design is restored." if wf.design_status == "ready"
                                            else " Maestro is reviewing it."), "info")
+    if name.strip() or description.strip():
+        flash(request, "The workflow was imported from the BPMN file; the name and description you typed "
+                       "were not used.", "info")
     return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
 
 

@@ -171,9 +171,16 @@ WORKFLOW CONTENT
 ```
 
 ## BPMN 2.0 import
+**Two entry points**, both posting to `POST /maestro/import-bpmn` (CSRF, multipart, with the Private / Shared choice):
+- The **Import BPMN** button on the *Projects* page (next to "Describe a new project", and in the empty state) opens
+  `GET /maestro/import-bpmn`: a page with a file input (`.bpmn`), the Private / Shared switch and a short explanation.
+  An invalid file returns to that page with an error.
+- A shortcut on *Create* ("Describe your project"): the drop zone also accepts a BPMN 2.0 file (`.bpmn`). Once
+  selected, the preview shows the badge "BPMN: will be imported" and the button reads "Import the workflow". An invalid
+  file returns to *Create* with an error. The Name and Description typed there are not used: a note says so after the
+  import.
 
-On *Create* ("Describe your project"), the drop zone also accepts a BPMN 2.0 file (`.bpmn`) from Maestro or any
-BPMN tool. A `.bpmn` file posts to `POST /maestro/import-bpmn` (CSRF, multipart) and the project takes the process
+A `.bpmn` file from Maestro or any BPMN tool is imported as a project that takes the process
 name (made unique among your projects: "X", "X (2)"). **Maestro does not execute BPMN**: the file is an input to the
 design. No LLM ever reads or writes the XML; parsing is deterministic (`app/maestro/bpmn.py`).
 

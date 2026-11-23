@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Import a BPMN workflow{% endblock %}
+{% block content %}
+<nav aria-label="breadcrumb"><ul><li><a href="/workflows">Projects</a></li><li>Import BPMN</li></ul></nav>
+<h1>Import a BPMN workflow</h1>
+<article>
+  <form method="post" action="/maestro/import-bpmn" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="origin" value="import">
+    <label for="bpmn-file"><strong>BPMN file</strong>
+      <input type="file" name="diagram" id="bpmn-file" accept=".bpmn,application/xml,text/xml" required>
+    </label>
+    {% include "partials/share_switch.html" %}
+    <small class="help">BPMN 2.0 files from Maestro or any BPMN tool (Camunda, Signavio, Bizagi). A file exported by Maestro is restored as is. For other files, Maestro checks what can run with Upsun Dispatch and asks you how to handle the rest.</small>
+    <button type="submit">{{ icon('upload') }}Import</button>
+  </form>
+</article>
+{% endblock %}
