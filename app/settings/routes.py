@@ -72,6 +72,11 @@ def settings_page(
                 if settings.github_hook_id else None
             ),
             "new_hook_secret": request.session.pop("new_hook_secret", None),
+            "linear_hook_url": (
+                f"{get_settings().public_base_url}/webhooks/linear/{settings.linear_hook_id}"
+                if settings.linear_hook_id else None
+            ),
+            "linear_hook_ready": bool(settings.linear_hook_id and settings.linear_hook_secret_encrypted),
         },
     )
 
@@ -289,6 +294,50 @@ def github_webhook_delete(
     db.commit()
     flash(request, "GitHub webhook removed. Remove it in GitHub too.", "success", section="github-webhook")
     return _back("github-webhook")
+
+
+# --- Linear webhook (wakes Maestro when a request is created or changes) ---------
+
+
+@router.post("/settings/linear-webhook", dependencies=[Depends(csrf_protect)])
+def linear_webhook_generate(
+    request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)
+) -> Response:
+    settings = get_user_settings(db, user)
+    settings.linear_hook_id = secrets.token_urlsafe(24)
+    settings.linear_hook_secret_encrypted = None  # Linear creates the signing secret: paste it next
+    db.commit()
+    flash(request, "Webhook URL created. Add it in Linear, then paste the signing secret Linear shows.", "success",
+          section="linear-webhook")
+    return _back("linear-webhook")
+
+
+@router.post("/settings/linear-webhook/secret", dependencies=[Depends(csrf_protect)])
+def linear_webhook_secret(
+    request: Request, secret: str = Form(""), user: User = Depends(require_user), db: Session = Depends(get_db)
+) -> Response:
+    settings = get_user_settings(db, user)
+    secret = secret.strip()
+    if not settings.linear_hook_id or len(secret) < 16:
+        flash(request, "Paste the signing secret shown on the webhook page in Linear.", "error",
+              section="linear-webhook")
+        return _back("linear-webhook")
+    settings.linear_hook_secret_encrypted = encrypt(secret)
+    db.commit()
+    flash(request, "Linear wake-up is on.", "success", section="linear-webhook")
+    return _back("linear-webhook")
+
+
+@router.post("/settings/linear-webhook/delete", dependencies=[Depends(csrf_protect)])
+def linear_webhook_delete(
+    request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)
+) -> Response:
+    settings = get_user_settings(db, user)
+    settings.linear_hook_id = None
+    settings.linear_hook_secret_encrypted = None
+    db.commit()
+    flash(request, "Linear wake-up turned off. Delete the webhook in Linear too.", "success", section="linear-webhook")
+    return _back("linear-webhook")
 
 
 # --- OAuth apps (admin) ---------------------------------------------

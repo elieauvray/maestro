@@ -8,6 +8,7 @@ import re
 import statistics
 import time
 from dataclasses import dataclass
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -984,23 +985,28 @@ def _mentions_repo(wf: Workflow, repo: str) -> bool:
     return repo.lower() in haystack
 
 
-def wake_for_repo(db: Session, user: User, repo: str) -> list[int]:
-    """Start a Maestro run now for each ready workflow of the user that works on this repository."""
+ACTIVE_STATUSES = {RunStatus.RUNNING, RunStatus.WAITING_APPROVAL, RunStatus.WAITING_INPUT}
+
+
+def _wake(db: Session, user: User, matches: Callable[[Workflow], bool], why: str) -> list[int]:
+    """Start a Maestro run now for each ready project of the user that `matches` (GitHub and Linear wake-ups)."""
     woken: list[int] = []
     workflows = db.scalars(
         select(Workflow).where(Workflow.user_id == user.id, Workflow.description.is_not(None),
                                Workflow.design_status == "ready")
     )
     for wf in workflows:
-        if not _mentions_repo(wf, repo) or missing_connectors(db, user, wf):
+        if not matches(wf) or missing_connectors(db, user, wf):
             continue
-        recent = db.scalar(
+        busy = db.scalar(
             select(WorkflowRun.id).where(
-                WorkflowRun.workflow_id == wf.id, WorkflowRun.started_at >= utcnow() - WAKE_DEBOUNCE
+                WorkflowRun.workflow_id == wf.id, WorkflowRun.user_id == user.id,
+                (WorkflowRun.status.in_(ACTIVE_STATUSES)) | (WorkflowRun.started_at >= utcnow() - WAKE_DEBOUNCE),
             ).limit(1)
         )
-        if recent or (wf.last_woken_at and _aware(wf.last_woken_at) >= utcnow() - WAKE_DEBOUNCE):
-            continue  # a run just started or was just requested: it will see the merge
+        if busy or (wf.last_woken_at and _aware(wf.last_woken_at) >= utcnow() - WAKE_DEBOUNCE):
+            # A run is going (it will see the change: this also ignores Maestro's own comments) or just started.
+            continue
         try:
             from app.runs.service import create_workflow_run
 
@@ -1010,7 +1016,25 @@ def wake_for_repo(db: Session, user: User, repo: str) -> list[int]:
             wf.last_woken_at = utcnow()
             db.commit()
             woken.append(wf.id)
-            log.info("Workflow %s woken by a merged pull request on %s", wf.id, repo)
+            log.info("Workflow %s woken: %s", wf.id, why)
         except ManagedAgentsError as exc:
             log.warning("Workflow %s: wake-up failed: %s", wf.id, exc)
     return woken
+
+
+def wake_for_repo(db: Session, user: User, repo: str) -> list[int]:
+    """GitHub: a pull request was merged on this repository."""
+    return _wake(db, user, lambda wf: _mentions_repo(wf, repo), f"pull request merged on {repo}")
+
+
+def _mentions_team(wf: Workflow, teams: set[str]) -> bool:
+    """The project works with one of these Linear teams (key, name or id, as a whole word)."""
+    values = " ".join(str(c.get("value") or "") for c in (wf.design_json or {}).get("config") or [])
+    haystack = " ".join([wf.content or "", wf.description or "", values])
+    return any(re.search(r"(?<![A-Za-z0-9])" + re.escape(t) + r"(?![A-Za-z0-9])", haystack, re.IGNORECASE)
+               for t in teams if t)
+
+
+def wake_for_linear(db: Session, user: User, teams: set[str], why: str) -> list[int]:
+    """Linear: a request was created or changed (status, labels, comment) in one of these teams."""
+    return _wake(db, user, lambda wf: _mentions_team(wf, teams), why)

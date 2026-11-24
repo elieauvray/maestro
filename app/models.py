@@ -106,6 +106,9 @@ class UserSettings(Base):
     # GitHub webhook that wakes Maestro when a pull request is merged
     github_hook_id: Mapped[str | None] = mapped_column(String(48), index=True, unique=True)
     github_hook_secret_encrypted: Mapped[str | None] = mapped_column(Text)
+    # Linear wake-up: the URL id Maestro gives, and the signing secret Linear shows (encrypted)
+    linear_hook_id: Mapped[str | None] = mapped_column(String(48), index=True, unique=True)
+    linear_hook_secret_encrypted: Mapped[str | None] = mapped_column(Text)
 
     user: Mapped[User] = relationship(back_populates="settings")
 

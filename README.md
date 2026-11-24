@@ -42,7 +42,9 @@ Dispatch, giving Dispatch every step it can do:
 3. **Launch.** *Run now* opens the settings of the run (prefilled with the last values; the owner can keep
    them for next time), then starts a run that you follow live. Projects are not scheduled: a run ends once
    Maestro has done its part, and the next one starts when you click *Run now* or when GitHub reports a
-   merged pull request on the project's repository (GitHub wake-up, in Settings).
+   merged pull request on the project's repository (GitHub wake-up), or when Linear reports a new or
+   changed request (new issue, status or label change, comment) in the project's team (Linear wake-up).
+   Both are set up in Settings; a project is not woken while one of its runs is going.
 
 **Following a run on its diagram.** Each run keeps a frozen copy of its workflow's design. On the run page,
 a compact map of the steps stays visible while you scroll the transcript (left column, or a band at the top on
@@ -105,7 +107,7 @@ Browser ──HTMX/SSE──▶ web (FastAPI, uvicorn) ──▶ PostgreSQL ◀�
 
 ### Run lifecycle
 
-1. The web app creates a `workflow_run` with the `running` status (Run now), or a GitHub wake-up starts one when a pull request is merged.
+1. The web app creates a `workflow_run` with the `running` status (Run now), or a GitHub or Linear wake-up starts one (merged pull request; new or changed Linear request).
 2. The worker claims it, creates the session (`agent`, `environment_id`, `vault_ids`), opens the stream, rereads the history (deduplication by event id), then sends the `user.message`.
 3. Each event is stored in `run_events` and updates the status:
    - `session.status_idle` + `requires_action` gives **waiting for approval**. The blocking `event_ids` are stored.
