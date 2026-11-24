@@ -13,7 +13,7 @@ from app.auth.routes import validate_new_credentials
 from app.config import get_settings
 from app.db import get_db
 from app.deps import csrf_protect, require_admin
-from app.models import OAuthState, RunEvent, Skill, User, UserSettings, Workflow, WorkflowRun
+from app.models import OAuthState, PendingBpmnImport, RunEvent, Skill, User, UserSettings, Workflow, WorkflowRun
 from app.security import hash_password
 from app.settings.service import client_for
 from app.templating import flash, render
@@ -106,6 +106,7 @@ def delete_user(
     db.execute(delete(WorkflowRun).where(WorkflowRun.user_id == user.id))
     db.execute(delete(Workflow).where(Workflow.user_id == user.id))
     db.execute(delete(OAuthState).where(OAuthState.user_id == user.id))
+    db.execute(delete(PendingBpmnImport).where(PendingBpmnImport.user_id == user.id))
     db.delete(user)  # ORM cascade: settings, connectors
     db.commit()
     flash(request, f"User {login} deleted and their vault archived.", "success")

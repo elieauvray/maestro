@@ -17,7 +17,7 @@ from app.maestro.bpmn import MAX_BYTES, BpmnImportError, ImportResult, bpmn_to_d
 from app.maestro.diagram import DIAGRAM_ONLY_DESCRIPTION, PDF_MAX_BYTES
 from app.maestro.diagram import validate as validate_diagram
 from app.maestro.render import render_design_svg, step_info
-from app.models import User, Workflow
+from app.models import PendingBpmnImport, User, Workflow
 from app.security import get_or_create_csrf_token
 from app.templating import flash, render, templates
 from app.workflows.routes import get_owned_workflow, get_visible_workflow
@@ -108,35 +108,49 @@ async def _create_from_bpmn(
     """Create page, "A BPMN file" mode: the typed name and the required context go with the imported process."""
     error = None
     result: ImportResult | None = None
+    xml = b""
     if not name or len(name) > 128:
         error = "The name must be between 1 and 128 characters."
     elif len(context) < 40:
         error = "Add some context (at least a few sentences): why this project, who is involved, which tools."
     else:
         try:
-            result = await _read_bpmn(bpmn)
+            xml = await _read_bpmn_bytes(bpmn)
+            result = bpmn_to_design(xml)
         except BpmnImportError as exc:
             error = str(exc)
     if result is not None:
+        if service.find_matching_project(db, user, result, name):  # the user chooses: update it or create a new one
+            pending_id = service.save_pending_import(db, user, xml, name, context, shared)
+            return RedirectResponse(f"/maestro/import-match/{pending_id}", status_code=303)
         try:
             wf = service.create_imported_workflow(db, user, result, shared=shared, name=name, context=context)
         except IntegrityError:
             db.rollback()
             error = f"You already have a project named {name}."
         else:
-            flash(request, "BPMN file imported." + (" Your design is restored." if wf.design_status == "ready"
-                                                   else " Maestro is reviewing it."), "info")
+            flash(request, "BPMN file imported." + _design_state(wf), "info")
             return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
     return render(request, "maestro_new.html", {"name": name, "description": context, "shared": shared,
                                                 "start": "bpmn", "error": f"{error} Choose the BPMN file again."},
                   status_code=400)
 
 
-async def _read_bpmn(upload: UploadFile | None) -> ImportResult:
-    """Read an uploaded .bpmn (at most 2 MB) and parse it. Raises BpmnImportError for an invalid file."""
+async def _read_bpmn_bytes(upload: UploadFile | None) -> bytes:
+    """Read an uploaded .bpmn: one byte more than the 2 MB limit, so the parser can refuse a larger file."""
     if upload is None or not upload.filename:
         raise BpmnImportError("Choose a BPMN file (.bpmn).")
-    return bpmn_to_design(await upload.read(MAX_BYTES + 1))
+    return await upload.read(MAX_BYTES + 1)
+
+
+async def _read_bpmn(upload: UploadFile | None) -> ImportResult:
+    """Read an uploaded .bpmn (at most 2 MB) and parse it. Raises BpmnImportError for an invalid file."""
+    return bpmn_to_design(await _read_bpmn_bytes(upload))
+
+
+def _design_state(wf: Workflow) -> str:
+    """The end of the flash after an import: the design came back as it was, or Maestro reviews the file."""
+    return " Your design is restored." if wf.design_status == "ready" else " Maestro is reviewing it."
 
 
 def _in_import_review(wf: Workflow) -> bool:
@@ -202,10 +216,121 @@ async def design_reimport_bpmn(
         flash(request, str(exc), "error")
         return RedirectResponse(f"/workflows/{wf.id}/import-bpmn", status_code=303)
     service.update_from_bpmn(db, wf, result, context.strip())
-    flash(request, "Project updated from the BPMN file." + (" Your design is restored."
-                                                          if wf.design_status == "ready"
-                                                          else " Maestro is reviewing it."), "info")
+    flash(request, "Project updated from the BPMN file." + _design_state(wf), "info")
     return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+
+
+# --- Create page: the file looks like one of the user's projects ---------------------------------
+
+_REVIEW_MESSAGE = "It has an import review in progress: finish or cancel it first."
+_PROJECT_BUSY_MESSAGE = "Wait until its current design is finished."
+_MATCH_REASONS = {"exported": "It was exported from", "name": "It has the same name as",
+                  "steps": "It has the same steps as"}
+
+
+def _update_blocker(wf: Workflow) -> str | None:
+    """Why the project cannot be updated now (the same limits as Import BPMN on its page), else None."""
+    if wf.design_status in _BUSY:
+        return _PROJECT_BUSY_MESSAGE
+    if _in_import_review(wf):
+        return _REVIEW_MESSAGE
+    return None
+
+
+def _pending(db: Session, user: User, pending_id: str) -> PendingBpmnImport:
+    row = service.load_pending_import(db, user, pending_id)
+    if row is None:
+        raise HTTPException(status_code=404)
+    return row
+
+
+def _match_page(
+    request: Request, db: Session, user: User, pending: PendingBpmnImport, result: ImportResult, *,
+    error: str | None = None, new_name: str | None = None, choice: str | None = None, status: int = 200,
+) -> Response:
+    """The choice page. The match is recomputed each time: the project may have changed since the upload."""
+    match = service.find_matching_project(db, user, result, pending.name)
+    blocker = _update_blocker(match.workflow) if match else None
+    can_update = match is not None and blocker is None
+    if choice == "update" and not can_update:
+        choice = None
+    preselect = choice if choice in ("update", "create") else (
+        "update" if can_update and match is not None and match.reason == "exported" else "create")
+    proposed = new_name if new_name is not None else service.proposed_name(db, user, pending.name or result.name)
+    return render(request, "maestro_bpmn_match.html", {
+        "pending": pending, "match": match, "reason_text": _MATCH_REASONS.get(match.reason, "") if match else "",
+        "update_blocker": blocker, "preselect": preselect, "proposed_name": proposed, "error": error,
+    }, status_code=status)
+
+
+def _pending_result(request: Request, db: Session, pending: PendingBpmnImport) -> ImportResult | None:
+    """Parse the stored file again, with the same parser and limits as the upload. None (row dropped) if it fails."""
+    try:
+        return bpmn_to_design(pending.xml)
+    except BpmnImportError as exc:  # should not happen: the file was parsed when it was uploaded
+        service.drop_pending_import(db, pending)
+        flash(request, str(exc), "error")
+        return None
+
+
+@router.get("/maestro/import-match/{pending_id}")
+def import_match_page(
+    request: Request, pending_id: str, user: User = Depends(require_configured), db: Session = Depends(get_db)
+) -> Response:
+    pending = _pending(db, user, pending_id)
+    result = _pending_result(request, db, pending)
+    if result is None:
+        return RedirectResponse("/maestro/new?start=bpmn", status_code=303)
+    return _match_page(request, db, user, pending, result)
+
+
+@router.post("/maestro/import-match/{pending_id}", dependencies=[Depends(csrf_protect)])
+def import_match_choose(
+    request: Request,
+    pending_id: str,
+    choice: str = Form(""),
+    new_name: str = Form(""),
+    user: User = Depends(require_configured),
+    db: Session = Depends(get_db),
+) -> Response:
+    pending = _pending(db, user, pending_id)
+    result = _pending_result(request, db, pending)
+    if result is None:
+        return RedirectResponse("/maestro/new?start=bpmn", status_code=303)
+    if choice == "update":
+        match = service.find_matching_project(db, user, result, pending.name)
+        if match is not None:
+            wf = _maestro(db, match.workflow.id, user)  # the target is the matched project, owner only
+            if _update_blocker(wf):
+                return _match_page(request, db, user, pending, result, choice="update", status=400)
+            service.update_from_bpmn(db, wf, result, pending.context)
+            service.drop_pending_import(db, pending)
+            flash(request, "Project updated from the BPMN file." + _design_state(wf), "info")
+            return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+    elif choice == "create":
+        new_name = new_name.strip()
+        if not new_name or len(new_name) > 128:
+            return _match_page(request, db, user, pending, result, choice="create", new_name=new_name,
+                               error="The name must be between 1 and 128 characters.", status=400)
+        try:
+            wf = service.create_imported_workflow(db, user, result, shared=pending.shared, name=new_name,
+                                                  context=pending.context)
+        except IntegrityError:
+            db.rollback()
+            return _match_page(request, db, user, pending, result, choice="create", new_name=new_name,
+                               error=f"You already have a project named {new_name}.", status=400)
+        service.drop_pending_import(db, pending)
+        flash(request, "BPMN file imported." + _design_state(wf), "info")
+        return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+    return _match_page(request, db, user, pending, result, error="Choose an option.", status=400)
+
+
+@router.post("/maestro/import-match/{pending_id}/cancel", dependencies=[Depends(csrf_protect)])
+def import_match_cancel(
+    pending_id: str, user: User = Depends(require_configured), db: Session = Depends(get_db)
+) -> Response:
+    service.drop_pending_import(db, _pending(db, user, pending_id))
+    return RedirectResponse("/maestro/new?start=bpmn", status_code=303)
 
 
 @router.get("/workflows/{workflow_id}/import/cancel")

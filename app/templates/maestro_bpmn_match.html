@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Existing project found{% endblock %}
+{% block content %}
+<nav aria-label="breadcrumb"><ul><li><a href="/workflows">Projects</a></li><li><a href="/maestro/new?start=bpmn">New project</a></li><li>Existing project found</li></ul></nav>
+<h1>This BPMN file looks like an existing project</h1>
+{% if error %}<div class="flash error" role="alert">{{ error }}</div>{% endif %}
+{% if match %}
+{% set wf = match.workflow %}
+<p class="lead">{{ reason_text }} <strong>{{ wf.name }}</strong>.</p>
+<article>
+  <p>
+    <strong>{{ wf.name }}</strong>
+    {% if wf.design_status in ['queued', 'generating'] %}<span class="badge running">designing</span>
+    {% elif wf.design_status == 'needs_answers' %}<span class="badge waiting_input">needs your answers</span>
+    {% elif wf.design_status == 'blocked' %}<span class="badge blocked">blocked</span>
+    {% elif wf.design_status == 'failed' %}<span class="badge failed">failed</span>
+    {% elif wf.design_status == 'ready' %}<span class="badge completed">ready</span>
+    {% endif %}
+  </p>
+  <p class="muted">Design updated {{ wf.design_updated_at | dt }}</p>
+  <a href="/workflows/{{ wf.id }}/design" target="_blank" rel="noopener">Open {{ wf.name }}</a>
+</article>
+{% else %}
+<div class="flash warning" role="status">The project this file matched is no longer there. You can still import the file as a new project.</div>
+{% endif %}
+<article>
+  <form method="post" action="/maestro/import-match/{{ pending.id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {% if match %}
+    <label class="option-card{% if update_blocker %} disabled{% endif %}" for="choice-update">
+      <input type="radio" name="choice" id="choice-update" value="update"{% if preselect == 'update' %} checked{% endif %}{% if update_blocker %} disabled{% endif %}>
+      <strong>Update {{ match.workflow.name }}</strong>
+      <p>Replace this project's design with the BPMN file. Settings you saved are kept for settings that still exist. Runs already started keep the design they started with. Your context is used for the review and the design.</p>
+      {% if update_blocker %}<p class="muted">{{ update_blocker }}</p>{% endif %}
+    </label>
+    {% endif %}
+    <div class="option-card">
+      <label for="choice-create">
+        <input type="radio" name="choice" id="choice-create" value="create"{% if preselect == 'create' %} checked{% endif %}>
+        <strong>Create a new project</strong>
+      </label>
+      <p>Import the file as a separate project.</p>
+      <input type="text" name="new_name" id="new-name" value="{{ proposed_name }}" required maxlength="128" aria-label="Name of the new project">
+    </div>
+    <div class="row-actions">
+      <button type="submit">{{ icon('continue') }}Continue</button>
+      <button type="submit" formaction="/maestro/import-match/{{ pending.id }}/cancel" formnovalidate class="secondary outline">{{ icon('close') }}Cancel</button>
+    </div>
+  </form>
+</article>
+<script>
+  document.getElementById('new-name').addEventListener('input', function () {
+    document.getElementById('choice-create').checked = true;
+  });
+</script>
+{% endblock %}

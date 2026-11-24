@@ -606,15 +606,15 @@ def test_a_bad_name_gives_a_400(client, fake, name):
         assert db.scalar(select(func.count()).select_from(Workflow)) == 0
 
 
-def test_a_name_already_taken_gives_a_400(client, fake):
+def test_a_name_already_taken_leads_to_the_choice_page(client, fake):
     _setup(client)
     assert _import(client, maestro_file()).status_code == 303
-    r = _import(client, CLEAN)
-    assert r.status_code == 400
-    assert "You already have a project named Support intake. Choose the BPMN file again." in r.text
+    r = _import(client, CLEAN)  # not a 400 any more: the file matches the project, the user chooses
+    assert r.status_code == 303 and r.headers["location"].startswith("/maestro/import-match/")
     with SessionLocal() as db:
         assert db.scalar(select(func.count()).select_from(Workflow)) == 1
     assert _import(client, CLEAN, name="Another name").status_code == 303  # the session stays usable
+    # The duplicate-name 400 now comes from the "Create a new project" choice (tests/test_bpmn_match.py)
 
 
 @pytest.mark.parametrize("xml", [CLEAN, maestro_file()])

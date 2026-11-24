@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     false,
+    func,
 )
 from sqlalchemy.orm import Mapped, deferred, mapped_column, relationship
 
@@ -228,6 +229,22 @@ class Workflow(Base):
     user: Mapped[User] = relationship()
     runs: Mapped[list[WorkflowRun]] = relationship(
         back_populates="workflow", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class PendingBpmnImport(Base):
+    """A BPMN file kept on the server while the user chooses between updating and creating."""
+
+    __tablename__ = "pending_bpmn_imports"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    xml: Mapped[bytes] = mapped_column(LargeBinary)
+    name: Mapped[str] = mapped_column(String(128))
+    context: Mapped[str] = mapped_column(Text)
+    shared: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, server_default=func.now()
     )
 
 
