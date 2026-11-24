@@ -171,18 +171,26 @@ WORKFLOW CONTENT
 ```
 
 ## BPMN 2.0 import
-**Two entry points**, both posting to `POST /maestro/import-bpmn` (CSRF, multipart, with the Private / Shared choice):
-- The **Import BPMN** button on the *Projects* page (next to "Describe a new project", and in the empty state) opens
-  `GET /maestro/import-bpmn`: a page with a file input (`.bpmn`), the Private / Shared switch and a short explanation.
-  An invalid file returns to that page with an error.
-- A shortcut on *Create* ("Describe your project"): the drop zone also accepts a BPMN 2.0 file (`.bpmn`). Once
-  selected, the preview shows the badge "BPMN: will be imported" and the button reads "Import the workflow". An invalid
-  file returns to *Create* with an error. The Name and Description typed there are not used: a note says so after the
-  import.
+**One entry point: the Create page** ("Describe your project"). Its **Start from** choice offers *A description* and
+*A BPMN file*. The **Import BPMN** buttons on the *Projects* page (next to "Describe a new project", and in the empty
+state) open `GET /maestro/new?start=bpmn`, which preselects *A BPMN file*. Dropping or pasting a `.bpmn` file on the
+Create page also switches to that mode. Both modes post to `POST /maestro/new` (CSRF, multipart, with the Private /
+Shared choice); `start=bpmn` selects the import. The old `/maestro/import-bpmn` URLs redirect to the Create page in
+BPMN mode.
 
-A `.bpmn` file from Maestro or any BPMN tool is imported as a project that takes the process
-name (made unique among your projects: "X", "X (2)"). **Maestro does not execute BPMN**: the file is an input to the
-design. No LLM ever reads or writes the XML; parsing is deterministic (`app/maestro/bpmn.py`).
+In BPMN mode you give:
+- the **Name** of the project. It is used as typed (a name you already use is an error; the process name in the file
+  is no longer used);
+- the **BPMN file** (`.bpmn`);
+- a required **Context** (at least 40 characters): why the project exists, who is involved, tools, constraints and
+  what the diagram does not say. It is stored with the project, as `## Context from the user` before
+  `## Imported BPMN process`, so the import review and the designer both read it.
+
+Any error (name, context, file, taken name) returns to *Create* in BPMN mode with the name, context and Private /
+Shared choice kept; choose the file again, since browsers do not keep file inputs.
+
+A `.bpmn` file from Maestro or any BPMN tool is imported as a project. **Maestro does not execute BPMN**: the file is
+an input to the design. No LLM ever reads or writes the XML; parsing is deterministic (`app/maestro/bpmn.py`).
 
 **Safe parsing.** The file is parsed with `defusedxml`. A DOCTYPE, entities and external references are rejected,
 the size limit is 2 MB, the root must be `definitions` in the BPMN 2.0 MODEL namespace
@@ -192,7 +200,8 @@ shows an error and creates no project.
 **Two cases.**
 - **A Maestro file that was not changed.** The `maestro:design` block holds the stored design and
   `maestro:stepsHash` matches the steps rebuilt from the BPMN elements (and the stored steps). The design is restored
-  as is, status `ready`, with no review and no Anthropic call.
+  as is, status `ready`, with no review and no Anthropic call. The context you typed is kept with the project, so
+  the next design reads it.
 - **Any other file** (another tool, or a Maestro file edited since the export). The process becomes a structured
   English description (lanes as roles, tasks in flow order with type, lane, id and documentation, gateways and their
   conditions, loops, multi-instance markers, timer start) plus **deterministic findings**, one per element that

@@ -142,12 +142,20 @@ REVIEW = {"issues": [
 ]}
 
 
-def _import(client, xml: str | bytes, filename: str = "process.bpmn", path: str = "/maestro/import-bpmn",
-            field: str = "diagram", token: str | None = None,
-            extra: dict[str, str] | None = None):  # type: ignore[no-untyped-def]
+CONTEXT = "We run support for a retail client; tickets come from Zendesk and the code lives in GitHub."
+
+
+def _import(client, xml: str | bytes, filename: str = "process.bpmn", path: str = "/maestro/new",
+            field: str = "bpmn", token: str | None = None, extra: dict[str, str] | None = None,
+            name: str = "Support intake", context: str = CONTEXT):  # type: ignore[no-untyped-def]
+    """Import from the Create page (BPMN mode). `path` and `field` can point at another import route."""
     token = token or csrf(client, "/maestro/new")
-    return client.post(path, data={"csrf_token": token, **(extra or {})}, files={field: (filename, xml, "application/xml")},
-                       follow_redirects=False)
+    data = {"csrf_token": token}
+    if path == "/maestro/new":
+        data.update({"start": "bpmn", "name": name, "description": context})
+    data.update(extra or {})
+    files = {field: (filename, xml, "application/xml")} if xml is not None else None
+    return client.post(path, data=data, files=files, follow_redirects=False)
 
 
 def _import_foreign(client, fake, review=REVIEW) -> int:  # type: ignore[no-untyped-def]
@@ -313,7 +321,8 @@ def test_unchanged_maestro_file_is_restored_as_ready_with_no_anthropic_call(clie
     assert _calls(fake) == (0, 0, 0, 0)
     with SessionLocal() as db:
         wf = db.get(Workflow, wf_id)
-        assert wf.name == "Stored project" and wf.design_status == "ready"
+        assert wf.name == "Support intake" and wf.design_status == "ready"
+        assert wf.description.startswith("## Context from the user\n" + CONTEXT + "\n\n## Imported BPMN process\n")
         assert wf.content == "# Mission\nStored prompt." and "orchestration_prompt" not in wf.design_json
         assert [s["id"] for s in wf.design_json["steps"]] == ["S1", "S2", "S3"]
         assert wf.design_json["config"][0]["value"] == "acme/shop" and wf.design_json["connectors_needed"] == ["github"]
@@ -442,6 +451,7 @@ def test_corrected_file_replaces_the_description_and_reruns_the_review(client, f
         assert wf.design_status == "queued" and wf.clarifications["kind"] == "import_pending"
         assert "Review the request" in wf.description and "Email the client" not in wf.description
         assert wf.name == "Support intake"  # the name stays
+        assert wf.description.startswith(f"## Context from the user\n{CONTEXT}\n\n")  # the context stays
     _design(wf_id)
     assert len(fake.review_calls) == 2 and "Review the request" in fake.review_calls[1]["description"]
     assert _state(wf_id)[0] == "ready"
@@ -485,12 +495,13 @@ def test_cancel_is_only_offered_while_the_dialog_is_open(client, fake):
 
 @pytest.mark.parametrize("payload", [b"plain text", b"<root/>", b"<!DOCTYPE x [<!ENTITY a 'b'>]><x>&a;</x>",
                                      b"<a>" + b"x" * (MAX_BYTES + 1) + b"</a>"])
-def test_invalid_files_flash_an_error_and_create_nothing(client, fake, payload):
+def test_invalid_files_give_a_400_and_create_nothing(client, fake, payload):
     _setup(client)
     r = _import(client, payload)
-    assert r.status_code == 303 and r.headers["location"] == "/maestro/new"
-    page = client.get("/maestro/new").text
-    assert 'class="flash error"' in page
+    assert r.status_code == 400
+    page = html.unescape(r.text)
+    assert 'class="flash error"' in page and "Choose the BPMN file again." in page
+    assert 'value="bpmn" checked' in page and "Support intake" in page and CONTEXT in page
     with SessionLocal() as db:
         assert db.scalar(select(func.count()).select_from(Workflow)) == 0
     assert _calls(fake) == (0, 0, 0, 0)
@@ -498,62 +509,158 @@ def test_invalid_files_flash_an_error_and_create_nothing(client, fake, payload):
 
 def test_no_file_is_an_error(client, fake):
     _setup(client)
-    token = csrf(client, "/maestro/new")
-    r = client.post("/maestro/import-bpmn", data={"csrf_token": token}, follow_redirects=False)
-    assert r.status_code == 303 and r.headers["location"] == "/maestro/new"
-    assert "Choose a BPMN file" in client.get("/maestro/new").text
-
-
-def test_importing_the_same_file_twice_gives_unique_names(client, fake):
-    _setup(client)
-    for _ in range(3):
-        assert _import(client, maestro_file()).status_code == 303
+    r = _import(client, None)
+    assert r.status_code == 400
+    assert "Choose a BPMN file (.bpmn). Choose the BPMN file again." in html.unescape(r.text)
     with SessionLocal() as db:
-        names = sorted(db.scalars(select(Workflow.name)))
-    assert names == ["Stored project", "Stored project (2)", "Stored project (3)"]
+        assert db.scalar(select(func.count()).select_from(Workflow)) == 0
 
 
-def test_the_describe_page_accepts_bpmn_and_the_edit_page_does_not(client, fake):
+# --- Create page, "A BPMN file" mode -----------------------------------------------------------------
+
+
+def test_the_create_page_starts_in_describe_mode(client, fake):
     _setup(client)
     page = client.get("/maestro/new").text
-    assert ".bpmn" in page
-    assert "A BPMN 2.0 file (.bpmn) is imported as a structured workflow instead." in page
+    assert 'value="describe" checked' in page and 'value="bpmn" checked' not in page
+    assert "Design the project" in page and 'name="diagram"' in page
     assert "Paste or drop an image (PNG, JPEG, GIF, WebP, 3.75 MB max) or a PDF (10 MB max)" in page
-    assert "BPMN: will be imported" in page and "Design the project" in page
+    assert 'id="bpmn-file" accept=".bpmn,application/xml,text/xml">' in page  # not required while hidden
+    assert 'name="description" id="description" class="huge" required' not in page
+    assert "A description" in page and "A BPMN file" in page
+
+
+def test_the_create_page_preselects_bpmn_mode(client, fake):
+    _setup(client)
+    page = client.get("/maestro/new?start=bpmn").text
+    assert 'value="bpmn" checked' in page and 'value="describe" checked' not in page
+    assert 'name="bpmn" id="bpmn-file" accept=".bpmn,application/xml,text/xml" required' in page
+    assert "BPMN 2.0 file from Maestro or any BPMN tool (Camunda, Signavio, Bizagi)." in page
+    assert ">Context<" in page and 'required minlength="40"' in page
+    assert ">Import the project<" in page
+    assert 'action="/maestro/new"' in page and 'enctype="multipart/form-data"' in page
+    assert 'name="csrf_token"' in page
+    assert 'value="describe" checked' in client.get("/maestro/new?start=other").text
+
+
+def test_the_edit_page_has_no_bpmn_mode(client, fake):
+    _setup(client)
     r = _import(client, maestro_file())
     wf_id = int(r.headers["location"].split("/")[2])
     edit = client.get(f"/workflows/{wf_id}/edit").text
-    assert "BPMN 2.0 file" not in edit and "BPMN: will be imported" not in edit
+    assert "A BPMN file" not in edit and 'name="bpmn"' not in edit and "BPMN: will be imported" not in edit
 
 
-# --- "Import BPMN" entry point ---------------------------------------------------------------
-
-
-def test_the_projects_page_links_to_the_import_page(client, fake):
+def test_a_foreign_file_keeps_the_typed_name_and_sends_the_context_to_the_review(client, fake):
     _setup(client)
-    page = client.get("/workflows").text  # empty state
-    assert 'href="/maestro/import-bpmn"' in page and "Import BPMN" in page
-    _import(client, CLEAN)
-    page = client.get("/workflows").text
-    describe = page.index("Describe a new project")
-    link = page.index('href="/maestro/import-bpmn"')
-    assert 0 < link - describe < 300 and "Import BPMN" in page[link:link + 700]
+    fake.review_response = REVIEW
+    r = _import(client, FOREIGN, name="Client support (TMA)")
+    assert r.status_code == 303 and r.headers["location"].endswith("/design")
+    wf_id = int(r.headers["location"].split("/")[2])
+    with SessionLocal() as db:
+        wf = db.get(Workflow, wf_id)
+        assert wf.name == "Client support (TMA)" and wf.design_status == "queued"
+        assert wf.clarifications["kind"] == "import_pending"
+        head, process = wf.description.split("\n\n## Imported BPMN process\n", 1)
+        assert head == "## Context from the user\n" + CONTEXT and "Email the client" in process
+    assert "BPMN file imported. Maestro is reviewing it." in client.get(r.headers["location"]).text
+    _design(wf_id)
+    assert CONTEXT in fake.review_calls[0]["description"] and "Email the client" in fake.review_calls[0]["description"]
 
 
-def test_the_import_page_has_a_file_input_the_share_switch_and_a_csrf_token(client, fake):
+def test_a_maestro_export_keeps_the_typed_name_and_the_context(client, fake):
     _setup(client)
-    r = client.get("/maestro/import-bpmn")
-    assert r.status_code == 200
-    page = r.text
-    assert 'type="file"' in page and 'name="diagram"' in page and "required" in page
-    assert 'accept=".bpmn,application/xml,text/xml"' in page
-    assert 'name="shared"' in page and 'name="origin" value="import"' in page
-    assert 'action="/maestro/import-bpmn"' in page and 'enctype="multipart/form-data"' in page
-    assert "Import a BPMN workflow" in page and "A file exported by Maestro is restored as is." in page
-    assert csrf(client, "/maestro/import-bpmn")
+    r = _import(client, maestro_file(), name="My typed name")
+    wf_id = int(r.headers["location"].split("/")[2])
+    assert _calls(fake) == (0, 0, 0, 0)
+    with SessionLocal() as db:
+        wf = db.get(Workflow, wf_id)
+        assert wf.name == "My typed name" and wf.design_status == "ready"
+        assert CONTEXT in wf.description and wf.description.startswith("## Context from the user")
+    assert "BPMN file imported. Your design is restored." in client.get(r.headers["location"]).text
 
 
-def test_the_import_page_requires_login(client, fake):
+@pytest.mark.parametrize("context", ["", "   ", "Too short to explain anything."])
+def test_a_missing_or_short_context_gives_a_400(client, fake, context):
+    _setup(client)
+    r = _import(client, CLEAN, name="Kept name", context=context, extra={"shared": "1"})
+    assert r.status_code == 400
+    page = html.unescape(r.text)
+    assert ("Add some context (at least a few sentences): why this project, who is involved, which tools. "
+            "Choose the BPMN file again.") in page
+    assert 'value="bpmn" checked' in page and 'value="Kept name"' in page and "checked" in page.split('name="shared"')[1][:80]
+    if context.strip():
+        assert context in page
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(Workflow)) == 0
+    assert _calls(fake) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("name", ["", "   ", "x" * 129])
+def test_a_bad_name_gives_a_400(client, fake, name):
+    _setup(client)
+    r = _import(client, CLEAN, name=name)
+    assert r.status_code == 400
+    assert "The name must be between 1 and 128 characters. Choose the BPMN file again." in r.text
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(Workflow)) == 0
+
+
+def test_a_name_already_taken_gives_a_400(client, fake):
+    _setup(client)
+    assert _import(client, maestro_file()).status_code == 303
+    r = _import(client, CLEAN)
+    assert r.status_code == 400
+    assert "You already have a project named Support intake. Choose the BPMN file again." in r.text
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(Workflow)) == 1
+    assert _import(client, CLEAN, name="Another name").status_code == 303  # the session stays usable
+
+
+@pytest.mark.parametrize("xml", [CLEAN, maestro_file()])
+@pytest.mark.parametrize("shared", [True, False])
+def test_import_respects_the_shared_choice(client, fake, xml, shared):
+    _setup(client)
+    r = _import(client, xml, extra={"shared": "1"} if shared else None)
+    assert r.status_code == 303 and r.headers["location"].endswith("/design")
+    wf_id = int(r.headers["location"].split("/")[2])
+    with SessionLocal() as db:
+        assert db.get(Workflow, wf_id).shared is shared
+
+
+def test_the_describe_path_is_unchanged(client, fake):
+    _setup(client)
+    token = csrf(client, "/maestro/new")
+    short = client.post("/maestro/new", data={"csrf_token": token, "name": "Short", "description": "Too short"},
+                        follow_redirects=False)
+    assert short.status_code == 400 and "Describe the project in more detail" in short.text
+    assert 'value="describe" checked' in short.text
+    text = "Requests arrive in Linear, a person validates the spec, Dispatch writes the code and a human merges it."
+    r = client.post("/maestro/new", data={"csrf_token": token, "name": "Described", "description": text},
+                    follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"].endswith("/design")
+    with SessionLocal() as db:
+        wf = db.scalars(select(Workflow).where(Workflow.name == "Described")).one()
+        assert wf.description == text and "Imported BPMN process" not in wf.description
+
+
+# --- Old import URLs and entry points --------------------------------------------------------------
+
+
+def test_the_old_import_page_redirects_to_the_create_page(client, fake):
+    _setup(client)
+    r = client.get("/maestro/import-bpmn", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/maestro/new?start=bpmn"
+    token = csrf(client, "/maestro/new")
+    r = client.post("/maestro/import-bpmn", data={"csrf_token": token}, files={"diagram": ("a.bpmn", CLEAN, "application/xml")},
+                    follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/maestro/new?start=bpmn"
+    assert "Import a BPMN file from the Create page." in client.get("/maestro/new?start=bpmn").text
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(Workflow)) == 0
+
+
+def test_the_old_import_page_requires_login(client, fake):
     _setup(client)
     token = csrf(client, "/")
     client.post("/logout", data={"csrf_token": token})
@@ -561,56 +668,16 @@ def test_the_import_page_requires_login(client, fake):
     assert r.status_code == 303 and r.headers["location"] == "/login"
 
 
-@pytest.mark.parametrize("xml", [CLEAN, maestro_file()])
-@pytest.mark.parametrize("shared", [True, False])
-def test_import_from_the_import_page_respects_the_shared_choice(client, fake, xml, shared):
+def test_the_projects_page_links_to_the_create_page_in_bpmn_mode(client, fake):
     _setup(client)
-    token = csrf(client, "/maestro/import-bpmn")
-    extra = {"origin": "import", **({"shared": "1"} if shared else {})}
-    r = _import(client, xml, token=token, extra=extra)
-    assert r.status_code == 303 and r.headers["location"].endswith("/design")
-    wf_id = int(r.headers["location"].split("/")[2])
-    with SessionLocal() as db:
-        assert db.get(Workflow, wf_id).shared is shared
-    assert "name and description you typed" not in client.get(r.headers["location"]).text
-
-
-@pytest.mark.parametrize("payload", [b"plain text", b"<root/>"])
-def test_an_invalid_file_from_the_import_page_returns_there(client, fake, payload):
-    _setup(client)
-    token = csrf(client, "/maestro/import-bpmn")
-    r = _import(client, payload, token=token, extra={"origin": "import"})
-    assert r.status_code == 303 and r.headers["location"] == "/maestro/import-bpmn"
-    assert 'class="flash error"' in client.get("/maestro/import-bpmn").text
-    with SessionLocal() as db:
-        assert db.scalar(select(func.count()).select_from(Workflow)) == 0
-    assert _calls(fake) == (0, 0, 0, 0)
-
-
-def test_no_file_from_the_import_page_returns_there(client, fake):
-    _setup(client)
-    token = csrf(client, "/maestro/import-bpmn")
-    r = client.post("/maestro/import-bpmn", data={"csrf_token": token, "origin": "import"}, follow_redirects=False)
-    assert r.status_code == 303 and r.headers["location"] == "/maestro/import-bpmn"
-    assert "Choose a BPMN file" in client.get("/maestro/import-bpmn").text
-
-
-def test_an_unknown_origin_falls_back_to_the_describe_page(client, fake):
-    _setup(client)
-    r = _import(client, b"plain text", extra={"origin": "https://evil.test/"})
-    assert r.status_code == 303 and r.headers["location"] == "/maestro/new"
-
-
-def test_typed_name_and_description_are_ignored_with_a_note(client, fake):
-    _setup(client)
-    r = _import(client, maestro_file(), extra={"name": "My typed name", "description": "Typed description"})
-    assert r.status_code == 303 and r.headers["location"].endswith("/design")
-    wf_id = int(r.headers["location"].split("/")[2])
-    with SessionLocal() as db:
-        assert db.get(Workflow, wf_id).name == "Stored project"
-    page = client.get(r.headers["location"]).text
-    assert "The workflow was imported from the BPMN file; the name and description you typed were not used." in page
-    assert "BPMN file imported." in page
+    page = client.get("/workflows").text  # empty state
+    assert 'href="/maestro/new?start=bpmn"' in page and "Import BPMN" in page
+    assert "/maestro/import-bpmn" not in page
+    _import(client, CLEAN)
+    page = client.get("/workflows").text
+    describe = page.index("Describe a new project")
+    link = page.index('href="/maestro/new?start=bpmn"')
+    assert 0 < link - describe < 300 and "Import BPMN" in page[link:link + 700]
 
 
 # --- Access ---------------------------------------------------------------------------------
@@ -653,7 +720,9 @@ def test_a_shared_dialog_is_not_answerable_by_a_viewer(client, fake):
 def test_posts_require_a_csrf_token(client, fake):
     _setup(client)
     wf_id = _import_foreign(client, fake)
-    files = {"diagram": ("a.bpmn", CLEAN, "application/xml")}
+    files = {"bpmn": ("a.bpmn", CLEAN, "application/xml")}
+    assert client.post("/maestro/new", data={"start": "bpmn", "name": "X", "description": CONTEXT},
+                       files=files).status_code == 403
     assert client.post("/maestro/import-bpmn", files=files).status_code == 403
     assert client.post(f"/workflows/{wf_id}/import-bpmn", files={"bpmn": ("a.bpmn", CLEAN, "application/xml")}
                        ).status_code == 403

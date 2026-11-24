@@ -5,7 +5,7 @@
   <h1 style="margin:0">Projects</h1>
   <div class="head-actions">
     <a href="/" role="button">{{ icon('create') }}Describe a new project</a>
-    <a href="/maestro/import-bpmn" role="button" class="secondary">{{ icon('upload') }}Import BPMN</a>
+    <a href="/maestro/new?start=bpmn" role="button" class="secondary">{{ icon('upload') }}Import BPMN</a>
   </div>
 </header>
 <p class="muted">Each project is a process Maestro designed from your description, from the request to production. Open one to review its design, then run it. The admin's <a href="/instructions">system instructions</a> apply to every project and take precedence over its description.</p>
@@ -48,7 +48,7 @@
   <p>No projects yet. Describe your first project, or import one from a BPMN file.</p>
   <div class="head-actions">
     <a href="/" role="button">{{ icon('create') }}Describe a project</a>
-    <a href="/maestro/import-bpmn" role="button" class="secondary">{{ icon('upload') }}Import BPMN</a>
+    <a href="/maestro/new?start=bpmn" role="button" class="secondary">{{ icon('upload') }}Import BPMN</a>
   </div>
 </article>
 {% endif %}
