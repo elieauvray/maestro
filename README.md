@@ -46,7 +46,9 @@ Dispatch, giving Dispatch every step it can do:
    new or changed request (new issue, status or label change, comment) in the project's team or Jira project
    (Linear and Jira wake-ups). A Linear webhook covers a whole team, so Maestro only wakes the projects
    whose settings name the issue's Linear project (for example `LINEAR_PROJECT`: name, ID or URL).
-   Both are set up in Settings; a project is not woken while one of its runs is going.
+   They are set up in Settings. A change that arrives while a run is going is queued and starts a
+   follow-up run when that run ends; Maestro's own tracker activity (recognized from its `MAESTRO-LEDGER`
+   comments) never wakes a run.
 
 **Following a run on its diagram.** Each run keeps a frozen copy of its workflow's design. On the run page,
 a compact map of the steps stays visible while you scroll the transcript (left column, or a band at the top on

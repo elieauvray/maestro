@@ -116,3 +116,42 @@ def test_linear_events_that_do_not_matter_are_ignored(client, fake):
     client.post("/settings/linear-webhook/delete", data={"csrf_token": token})
     body = _payload("Issue", "create", {"identifier": "ELI-5"})
     assert _post(client, path, "Issue", body).status_code == 404
+
+
+def test_changes_during_a_run_start_a_follow_up_and_maestro_s_own_activity_does_not(client, fake):
+    from app.maestro import service
+    from app.models import UserSettings
+
+    uid, path, (tma, _other), token = _setup(client)
+    client.post("/settings/linear-webhook/secret", data={"secret": SECRET, "csrf_token": token})
+    project = {"id": "9b1e-uuid", "name": "TMA portal", "slugId": "3f2a1b9c0d"}
+    first = _payload("Issue", "create", {"id": "iss-1", "projectId": "9b1e-uuid", "project": project},
+                     actor={"id": "client-1"})
+    assert _post(client, path, "Issue", first).json()["woken_workflows"] == [tma]
+
+    # During the run, Maestro posts its ledger: its account is learned and its events are ignored
+    ledger = _payload("Comment", "create", {"issueId": "iss-1", "body": "MAESTRO-LEDGER tma v1\nstate: active"},
+                      actor={"id": "maestro-account"})
+    assert _post(client, path, "Comment", ledger).json()["woken_workflows"] == []
+    with SessionLocal() as db:
+        assert db.get(UserSettings, uid).linear_self_actor == "maestro-account"
+        assert db.get(Workflow, tma).wake_pending is None
+    own = _payload("Issue", "update", {"id": "iss-1", "projectId": "9b1e-uuid"}, updatedFrom={"stateId": "a"},
+                   actor={"id": "maestro-account"})
+    _post(client, path, "Issue", own)
+    with SessionLocal() as db:
+        assert db.get(Workflow, tma).wake_pending is None
+
+    # A person's change during the run is queued, then runs once the current run ends
+    second = _payload("Issue", "create", {"id": "iss-2", "projectId": "9b1e-uuid"}, actor={"id": "client-1"})
+    assert _post(client, path, "Issue", second).json()["woken_workflows"] == []
+    with SessionLocal() as db:
+        assert db.get(Workflow, tma).wake_pending
+        assert service.start_pending_wakes(db) == []  # the first run is still going
+        run = db.query(WorkflowRun).filter_by(workflow_id=tma).one()
+        run.status, run.finished_at = "completed", utcnow()
+        db.commit()
+        assert service.start_pending_wakes(db) == [tma]
+        runs = db.query(WorkflowRun).filter_by(workflow_id=tma).order_by(WorkflowRun.id).all()
+        assert [r.trigger for r in runs] == ["wake", "follow-up"] and db.get(Workflow, tma).wake_pending is None
+        assert "MAESTRO-LEDGER" in runs[-1].initial_message  # Maestro is told to mark its ledgers

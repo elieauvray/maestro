@@ -274,7 +274,7 @@ class Worker:
                 del self.threads[rid]
 
     def maestro_jobs(self, db: Session) -> None:
-        """Generate queued Maestro designs."""
+        """Generate queued Maestro designs and start the runs queued by wake-ups."""
         from app.maestro import service as maestro
 
         self.design_threads = {k: t for k, t in getattr(self, "design_threads", {}).items() if t.is_alive()}
@@ -283,6 +283,10 @@ class Worker:
             self.design_threads[wf_id] = t
             t.start()
             log.info("Workflow %s: design generation started", wf_id)
+        try:  # wake-ups that arrived while a run was going
+            maestro.start_pending_wakes(db)
+        except Exception:
+            log.exception("Could not start the queued wake-ups")
 
     def tick(self) -> None:
         db = SessionLocal()

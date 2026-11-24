@@ -90,6 +90,29 @@ async def github_webhook(hook_id: str, request: Request, db: Session = Depends(g
     return JSONResponse({"repository": repo, "woken_workflows": woken}, status_code=202)
 
 
+# --- Maestro's own tracker activity ------------------------------------------------------
+
+def _text(value: Any) -> str:
+    """Comment body as text: a string, or an Atlassian document (nested "text" nodes)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join([str(value.get("text") or "")] + [_text(c) for c in value.get("content") or []])
+    if isinstance(value, list):
+        return " ".join(_text(v) for v in value)
+    return ""
+
+
+def _is_self(settings: UserSettings, field: str, actor: str, comment_body: str) -> bool:
+    """Whether the event comes from the account Maestro acts with (learned from Maestro's ledger comments, which
+    always start with the ledger marker). Its events are ignored only while a run is going or just ended."""
+    from app.maestro.service import LEDGER_MARKER
+
+    if actor and LEDGER_MARKER in comment_body and getattr(settings, field) != actor:
+        setattr(settings, field, actor)
+    return bool(actor) and getattr(settings, field) == actor
+
+
 # --- Linear: wake the projects of a team when a request is created or changes --------------
 
 LINEAR_MAX_AGE_MS = 120_000  # Linear advises checking webhookTimestamp; allow a little clock drift
@@ -191,6 +214,10 @@ async def linear_webhook(hook_id: str, request: Request, db: Session = Depends(g
     if not isinstance(sent, (int, float)) or abs(time.time() * 1000 - sent) > LINEAR_MAX_AGE_MS:
         raise HTTPException(status_code=400, detail="Stale or missing webhookTimestamp.")
     event = request.headers.get("linear-event") or str(payload.get("type") or "")
+    actor = str((payload.get("actor") or {}).get("id") or "") if isinstance(payload.get("actor"), dict) else ""
+    body_text = _text((payload.get("data") or {}).get("body")) if event == "Comment" else ""
+    own = _is_self(settings, "linear_self_actor", actor, body_text)
+    db.commit()
     why = linear_wake_reason(event, payload)
     if why is None:
         return JSONResponse({"ignored": f"{event}.{payload.get('action')}"})
@@ -205,7 +232,7 @@ async def linear_webhook(hook_id: str, request: Request, db: Session = Depends(g
         return JSONResponse({"ignored": "issue not in a known Linear project"})
     from app.maestro.service import wake_for_linear
 
-    woken = await run_in_threadpool(wake_for_linear, db, user, projects, why)
+    woken = await run_in_threadpool(wake_for_linear, db, user, projects, why, own)
     log.info("Linear: %s, %d project(s) woken", why, len(woken))
     return JSONResponse({"woken_workflows": woken}, status_code=202)
 
@@ -261,6 +288,11 @@ async def jira_webhook(hook_id: str, request: Request, db: Session = Depends(get
     sent = payload.get("timestamp")
     if isinstance(sent, (int, float)) and abs(time.time() * 1000 - sent) > JIRA_MAX_AGE_MS:
         raise HTTPException(status_code=400, detail="Stale timestamp.")
+    comment = payload.get("comment") if isinstance(payload.get("comment"), dict) else {}
+    author = (comment.get("author") or {}) if comment else (payload.get("user") or {})
+    actor = str(author.get("accountId") or "") if isinstance(author, dict) else ""
+    own = _is_self(settings, "jira_self_actor", actor, _text(comment.get("body")) if comment else "")
+    db.commit()
     why = jira_wake_reason(payload)
     if why is None:
         return JSONResponse({"ignored": str(payload.get("webhookEvent"))})
@@ -270,6 +302,6 @@ async def jira_webhook(hook_id: str, request: Request, db: Session = Depends(get
         return JSONResponse({"ignored": "no project"})
     from app.maestro.service import wake_for_jira
 
-    woken = await run_in_threadpool(wake_for_jira, db, user, projects, why)
+    woken = await run_in_threadpool(wake_for_jira, db, user, projects, why, own)
     log.info("Jira: %s, %d project(s) woken", why, len(woken))
     return JSONResponse({"projects": sorted(projects), "woken_workflows": woken}, status_code=202)

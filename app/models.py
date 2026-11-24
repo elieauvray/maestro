@@ -112,6 +112,9 @@ class UserSettings(Base):
     # Jira wake-up: the URL id and the secret Maestro generates for the Jira webhook (encrypted)
     jira_hook_id: Mapped[str | None] = mapped_column(String(48), index=True, unique=True)
     jira_hook_secret_encrypted: Mapped[str | None] = mapped_column(Text)
+    # The tracker accounts Maestro acts with (learned from its ledger comments): their events never wake a run
+    linear_self_actor: Mapped[str | None] = mapped_column(String(128))
+    jira_self_actor: Mapped[str | None] = mapped_column(String(128))
 
     user: Mapped[User] = relationship(back_populates="settings")
 
@@ -210,6 +213,9 @@ class Workflow(Base):
     deployment_id: Mapped[str | None] = mapped_column(String(128))
     deployment_status: Mapped[str | None] = mapped_column(String(16))  # active | paused
     last_woken_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # A wake-up that arrived while a run was going: a run starts as soon as that run ends
+    wake_pending: Mapped[str | None] = mapped_column(Text)
+    wake_pending_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Fingerprint of the system instructions the current design was generated with (stale when they change).
     instructions_hash: Mapped[str | None] = mapped_column(String(64))
     # Diagram of the process uploaded or pasted on the describe page (image or PDF), read by Claude.

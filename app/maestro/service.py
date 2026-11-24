@@ -902,6 +902,9 @@ def values_from_message(message: str, wf: Workflow) -> dict[str, str]:
     return values
 
 
+LEDGER_MARKER = "MAESTRO-LEDGER"
+
+
 def run_context(wf: Workflow, trigger: str, values: dict[str, str] | None = None) -> str:
     """Block appended to the orchestration prompt on every Maestro run (`values`: settings given at launch)."""
     config = [
@@ -930,6 +933,8 @@ def run_context(wf: Workflow, trigger: str, values: dict[str, str] | None = None
         f"Trigger: {trigger}. You are Maestro. Read the ledgers first. For each Dispatch workflow you started, "
         "check its completion signal; never interact with it. Start what can be started, stop at human gates, "
         "do not wait for Dispatch, then end with the status report.\n\n"
+        f"Begin every ledger comment you post or edit with the line `{LEDGER_MARKER}`: Maestro uses it to tell "
+        "its own tracker activity from the activity of people.\n\n"
         f"{markers}"
         "## Workflow status\n"
         "The run page shows whether the workflow is finished. End your final status report with exactly one "
@@ -988,7 +993,11 @@ def _mentions_repo(wf: Workflow, repo: str) -> bool:
 ACTIVE_STATUSES = {RunStatus.RUNNING, RunStatus.WAITING_APPROVAL, RunStatus.WAITING_INPUT}
 
 
-def _wake(db: Session, user: User, matches: Callable[[Workflow], bool], why: str) -> list[int]:
+SELF_QUIET = timedelta(minutes=3)  # Maestro's own tracker events still arrive just after its run ends
+
+
+def _wake(db: Session, user: User, matches: Callable[[Workflow], bool], why: str,
+          own_activity: bool = False) -> list[int]:
     """Start a Maestro run now for each ready project of the user that `matches` (GitHub and Linear wake-ups)."""
     woken: list[int] = []
     workflows = db.scalars(
@@ -998,15 +1007,27 @@ def _wake(db: Session, user: User, matches: Callable[[Workflow], bool], why: str
     for wf in workflows:
         if not matches(wf) or missing_connectors(db, user, wf):
             continue
-        busy = db.scalar(
-            select(WorkflowRun.id).where(
-                WorkflowRun.workflow_id == wf.id, WorkflowRun.user_id == user.id,
-                (WorkflowRun.status.in_(ACTIVE_STATUSES)) | (WorkflowRun.started_at >= utcnow() - WAKE_DEBOUNCE),
-            ).limit(1)
+        active = db.scalar(
+            select(WorkflowRun.id).where(WorkflowRun.workflow_id == wf.id, WorkflowRun.user_id == user.id,
+                                         WorkflowRun.status.in_(ACTIVE_STATUSES)).limit(1)
         )
-        if busy or (wf.last_woken_at and _aware(wf.last_woken_at) >= utcnow() - WAKE_DEBOUNCE):
-            # A run is going (it will see the change: this also ignores Maestro's own comments) or just started.
+        if own_activity and (active or db.scalar(
+                select(WorkflowRun.id).where(WorkflowRun.workflow_id == wf.id, WorkflowRun.user_id == user.id,
+                                             WorkflowRun.finished_at >= utcnow() - SELF_QUIET).limit(1))):
+            continue  # Maestro's own work during (or just after) its run: never a reason for another run
+        if active:
+            # The run going may have read the tracker before this change: start another one when it ends.
+            if not wf.wake_pending:
+                wf.wake_pending, wf.wake_pending_at = why[:500], utcnow()
+                db.commit()
+                log.info("Workflow %s: wake-up queued until run %s ends (%s)", wf.id, active, why)
             continue
+        recent = db.scalar(
+            select(WorkflowRun.id).where(WorkflowRun.workflow_id == wf.id, WorkflowRun.user_id == user.id,
+                                         WorkflowRun.started_at >= utcnow() - WAKE_DEBOUNCE).limit(1)
+        )
+        if recent or (wf.last_woken_at and _aware(wf.last_woken_at) >= utcnow() - WAKE_DEBOUNCE):
+            continue  # a run just started: it reads the tracker after this change
         try:
             from app.runs.service import create_workflow_run
 
@@ -1060,12 +1081,53 @@ def matches_linear_project(values: list[str], hints: set[str]) -> bool:
     return any(w.endswith("-" + h) or h.endswith("-" + w) for w in wanted for h in have if len(min(w, h, key=len)) >= 6)
 
 
-def wake_for_linear(db: Session, user: User, project_hints: set[str], why: str) -> list[int]:
+def wake_for_linear(db: Session, user: User, project_hints: set[str], why: str,
+                    own_activity: bool = False) -> list[int]:
     """Linear: a request was created or changed in a Linear project. Only the Maestro projects whose settings
     name that Linear project are woken: other issues of the team are ignored."""
-    return _wake(db, user, lambda wf: matches_linear_project(linear_project_values(wf), project_hints), why)
+    return _wake(db, user, lambda wf: matches_linear_project(linear_project_values(wf), project_hints), why,
+                 own_activity)
 
 
-def wake_for_jira(db: Session, user: User, projects: set[str], why: str) -> list[int]:
+def wake_for_jira(db: Session, user: User, projects: set[str], why: str, own_activity: bool = False) -> list[int]:
     """Jira: a request was created or changed (status, labels, resolution, comment) in one of these projects."""
-    return _wake(db, user, lambda wf: _mentions_team(wf, projects), why)
+    return _wake(db, user, lambda wf: _mentions_team(wf, projects), why, own_activity)
+
+
+MAX_FOLLOW_UPS = 3  # in a row: a safety net in case Maestro's own activity was not recognized
+
+
+def start_pending_wakes(db: Session) -> list[int]:
+    """Start the run a wake-up asked for while another run was going, once that run has ended."""
+    started: list[int] = []
+    for wf in db.scalars(select(Workflow).where(Workflow.wake_pending.is_not(None))):
+        user = db.get(User, wf.user_id)
+        if user is None or wf.design_status != "ready":
+            wf.wake_pending = wf.wake_pending_at = None
+            db.commit()
+            continue
+        if db.scalar(select(WorkflowRun.id).where(WorkflowRun.workflow_id == wf.id, WorkflowRun.user_id == user.id,
+                                                  WorkflowRun.status.in_(ACTIVE_STATUSES)).limit(1)):
+            continue  # still going
+        last = list(db.scalars(select(WorkflowRun.trigger).where(WorkflowRun.workflow_id == wf.id)
+                               .order_by(WorkflowRun.id.desc()).limit(MAX_FOLLOW_UPS)))
+        why = wf.wake_pending
+        wf.wake_pending = wf.wake_pending_at = None
+        db.commit()
+        if len(last) == MAX_FOLLOW_UPS and all(t == "follow-up" for t in last):
+            log.warning("Workflow %s: %s follow-up runs in a row, not starting another (%s)", wf.id, MAX_FOLLOW_UPS, why)
+            continue
+        if missing_connectors(db, user, wf):
+            continue
+        try:
+            from app.runs.service import create_workflow_run
+
+            run = create_workflow_run(db, user, wf)
+            run.trigger = "follow-up"
+            wf.last_woken_at = utcnow()
+            db.commit()
+            started.append(wf.id)
+            log.info("Workflow %s: follow-up run %s for a change during the previous run (%s)", wf.id, run.id, why)
+        except ManagedAgentsError as exc:
+            log.warning("Workflow %s: follow-up run failed to start: %s", wf.id, exc)
+    return started
