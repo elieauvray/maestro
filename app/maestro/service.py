@@ -194,7 +194,7 @@ def find_matching_project(db: Session, user: User, result: ImportResult, typed_n
         hit = _freshest([w for w in own if w.name.strip().casefold() in names])
         if hit:
             return ProjectMatch(hit, "name")
-    if result.steps_fingerprint is not None:
+    if result.steps_fingerprint is not None and result.steps_fingerprint != steps_hash([]):  # no steps: no match
         hit = _freshest([w for w in own if w.design_status == "ready"
                          and steps_hash((w.design_json or {}).get("steps") or []) == result.steps_fingerprint])
         if hit:
@@ -213,12 +213,21 @@ def proposed_name(db: Session, user: User, base: str) -> str:
 # --- Pending import: the file kept on the server until the user chooses -------------------------
 
 PENDING_TTL = timedelta(hours=1)
+PENDING_MAX_PER_USER = 3  # a few open tabs; older files of the user are dropped
 
 
 def save_pending_import(db: Session, user: User, xml: bytes, name: str, context: str, shared: bool) -> str:
-    """Keep the uploaded file for the choice page; this user's expired files are deleted first."""
-    db.execute(delete(PendingBpmnImport).where(PendingBpmnImport.user_id == user.id,
-                                               PendingBpmnImport.created_at < utcnow() - PENDING_TTL))
+    """Keep the uploaded file for the choice page.
+
+    Expired files (of every user) are deleted first, then the user's oldest files so that at most
+    PENDING_MAX_PER_USER remain once this one is saved.
+    """
+    db.execute(delete(PendingBpmnImport).where(PendingBpmnImport.created_at < utcnow() - PENDING_TTL))
+    stale = list(db.scalars(select(PendingBpmnImport.id).where(PendingBpmnImport.user_id == user.id)
+                            .order_by(PendingBpmnImport.created_at.desc(), PendingBpmnImport.id)
+                            .offset(PENDING_MAX_PER_USER - 1)))
+    if stale:
+        db.execute(delete(PendingBpmnImport).where(PendingBpmnImport.id.in_(stale)))
     row = PendingBpmnImport(id=str(uuid4()), user_id=user.id, xml=xml, name=name, context=context,
                             shared=shared, created_at=utcnow())
     db.add(row)
