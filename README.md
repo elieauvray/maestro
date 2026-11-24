@@ -44,7 +44,8 @@ Dispatch, giving Dispatch every step it can do:
    Maestro has done its part, and the next one starts when you click *Run now* or when GitHub reports a
    merged pull request on the project's repository (GitHub wake-up), or when Linear or Jira reports a
    new or changed request (new issue, status or label change, comment) in the project's team or Jira project
-   (Linear and Jira wake-ups).
+   (Linear and Jira wake-ups). A Linear webhook covers a whole team, so Maestro only wakes the projects
+   whose settings name the issue's Linear project (for example `LINEAR_PROJECT`: name, ID or URL).
    Both are set up in Settings; a project is not woken while one of its runs is going.
 
 **Following a run on its diagram.** Each run keeps a frozen copy of its workflow's design. On the run page,

@@ -103,20 +103,57 @@ def linear_signature_ok(secret: str, body: bytes, header: str | None) -> bool:
     return hmac.compare_digest(expected, header.strip())
 
 
-def _team_hints(data: dict[str, Any]) -> set[str]:
-    """Ways a project may name the request's team: key (from "ELI-14" too), name, id."""
+def _project_hints(obj: Any) -> set[str]:
+    """How the Linear project of an issue appears in a payload: nested project (id, name, url, slugId), projectId."""
     hints: set[str] = set()
-    for obj in (data, data.get("issue") or {}):
-        if not isinstance(obj, dict):
-            continue
-        team = obj.get("team") or {}
-        if isinstance(team, dict):
-            hints.update(str(team.get(k) or "") for k in ("key", "name", "id"))
-        hints.add(str(obj.get("teamId") or ""))
-        m = re.match(r"^([A-Za-z][A-Za-z0-9]*)-\d+$", str(obj.get("identifier") or ""))
-        if m:
-            hints.add(m.group(1))
+    if not isinstance(obj, dict):
+        return hints
+    project = obj.get("project")
+    if isinstance(project, dict):
+        hints.update(str(project.get(k) or "") for k in ("id", "name", "url", "slugId"))
+    hints.add(str(obj.get("projectId") or ""))
     return {h for h in hints if h}
+
+
+def _known_aliases(db: Session, user_id: int, hints: set[str]) -> set[str]:
+    """Add the other names Maestro has seen for the same Linear project (an event may carry only its id,
+    another its id, name and URL), so a setting holding the name or URL still matches."""
+    from app.models import LinearIssueProject
+
+    if not hints:
+        return hints
+    known = set(hints)
+    for row in db.scalars(select(LinearIssueProject).where(LinearIssueProject.user_id == user_id)):
+        if known & set(row.project_hints or []):
+            known |= set(row.project_hints)
+    return known
+
+
+def linear_issue_project(db: Session, user_id: int, event: str, data: dict[str, Any]) -> set[str]:
+    """The Linear project of the event's issue. Issue events carry it (and Maestro remembers it); comment events
+    usually carry only the issue id, so the project is looked up from what Maestro learned earlier."""
+    from app.models import LinearIssueProject
+
+    if event == "Issue":
+        hints = _known_aliases(db, user_id, _project_hints(data))
+        issue_id = str(data.get("id") or "")
+        if issue_id:
+            row = db.scalar(select(LinearIssueProject).where(LinearIssueProject.user_id == user_id,
+                                                             LinearIssueProject.issue_id == issue_id))
+            if row is None:
+                db.add(LinearIssueProject(user_id=user_id, issue_id=issue_id, project_hints=sorted(hints)))
+            else:
+                row.project_hints = sorted(hints)
+            db.commit()
+        return hints
+    issue = data.get("issue") if isinstance(data.get("issue"), dict) else {}
+    hints = _known_aliases(db, user_id, _project_hints(issue))
+    if hints:
+        return hints
+    issue_id = str(data.get("issueId") or issue.get("id") or "")
+    row = db.scalar(select(LinearIssueProject).where(LinearIssueProject.user_id == user_id,
+                                                     LinearIssueProject.issue_id == issue_id)) if issue_id else None
+    return set(row.project_hints) if row else set()
 
 
 def linear_wake_reason(event: str, payload: dict[str, Any]) -> str | None:
@@ -157,15 +194,20 @@ async def linear_webhook(hook_id: str, request: Request, db: Session = Depends(g
     why = linear_wake_reason(event, payload)
     if why is None:
         return JSONResponse({"ignored": f"{event}.{payload.get('action')}"})
-    teams = _team_hints(payload.get("data") or {})
+    data = payload.get("data") or {}
+    # Field names of Linear's payloads are only partly documented: log their keys (never their values).
+    log.info("Linear %s.%s data keys: %s", event, payload.get("action"), sorted(data.keys()) if isinstance(data, dict) else "?")
     user = db.get(User, settings.user_id)
-    if not teams or user is None:
-        return JSONResponse({"ignored": "no team"})
+    if user is None or not isinstance(data, dict):
+        return JSONResponse({"ignored": "no user"})
+    projects = await run_in_threadpool(linear_issue_project, db, user.id, event, data)
+    if not projects:
+        return JSONResponse({"ignored": "issue not in a known Linear project"})
     from app.maestro.service import wake_for_linear
 
-    woken = await run_in_threadpool(wake_for_linear, db, user, teams, why)
+    woken = await run_in_threadpool(wake_for_linear, db, user, projects, why)
     log.info("Linear: %s, %d project(s) woken", why, len(woken))
-    return JSONResponse({"teams": sorted(teams), "woken_workflows": woken}, status_code=202)
+    return JSONResponse({"woken_workflows": woken}, status_code=202)
 
 
 # --- Jira: wake the projects of a Jira project when a request is created or changes -------

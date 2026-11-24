@@ -1035,9 +1035,35 @@ def _mentions_team(wf: Workflow, teams: set[str]) -> bool:
                for t in teams if t)
 
 
-def wake_for_linear(db: Session, user: User, teams: set[str], why: str) -> list[int]:
-    """Linear: a request was created or changed (status, labels, comment) in one of these teams."""
-    return _wake(db, user, lambda wf: _mentions_team(wf, teams), why)
+def linear_project_values(wf: Workflow) -> list[str]:
+    """The Linear project(s) a Maestro project works on: its settings named like LINEAR_PROJECT."""
+    return [str(c.get("value") or "").strip() for c in (wf.design_json or {}).get("config") or []
+            if "LINEAR" in str(c.get("key") or "").upper() and "PROJECT" in str(c.get("key") or "").upper()
+            and str(c.get("value") or "").strip()]
+
+
+def _norm(text: str) -> str:
+    text = text.strip().lower().rstrip("/")
+    if "linear.app/" in text:  # a project URL: keep the segment after /project/ (slug ending with its short id)
+        parts = text.split("?")[0].split("#")[0].split("/")
+        text = parts[parts.index("project") + 1] if "project" in parts[:-1] else parts[-1]
+    return text
+
+
+def matches_linear_project(values: list[str], hints: set[str]) -> bool:
+    """A setting value (name, id or URL) designates the event's Linear project (name, id, URL or short id)."""
+    wanted = {_norm(v) for v in values} - {""}
+    have = {_norm(h) for h in hints} - {""}
+    if wanted & have:
+        return True
+    # A project URL slug ends with the short id ("tma-portal-3f2a1b9c0d"), which Linear also sends on its own.
+    return any(w.endswith("-" + h) or h.endswith("-" + w) for w in wanted for h in have if len(min(w, h, key=len)) >= 6)
+
+
+def wake_for_linear(db: Session, user: User, project_hints: set[str], why: str) -> list[int]:
+    """Linear: a request was created or changed in a Linear project. Only the Maestro projects whose settings
+    name that Linear project are woken: other issues of the team are ignored."""
+    return _wake(db, user, lambda wf: matches_linear_project(linear_project_values(wf), project_hints), why)
 
 
 def wake_for_jira(db: Session, user: User, projects: set[str], why: str) -> list[int]:

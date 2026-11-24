@@ -359,3 +359,16 @@ class LoginAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )
+
+
+class LinearIssueProject(Base):
+    """The Linear project of an issue, learned from Issue webhooks (Comment webhooks only carry the issue id)."""
+
+    __tablename__ = "linear_issue_projects"
+    __table_args__ = (UniqueConstraint("user_id", "issue_id", name="uq_linear_issue_project"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    issue_id: Mapped[str] = mapped_column(String(64))
+    project_hints: Mapped[list[str]] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

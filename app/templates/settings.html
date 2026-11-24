@@ -166,7 +166,7 @@
   <details class="card fold" id="linear-webhook" {% if not linear_hook_ready %}open{% endif %}>
     <summary>Wake-up on new or changed requests <span class="badge {{ 'configured' if linear_hook_ready else 'not_configured' }}">{{ 'On' if linear_hook_ready else ('Waiting for the secret' if linear_hook_url else 'Off') }}</span></summary>
     {{ section_flashes('linear-webhook') }}
-    <p class="small">When a request is created in Linear, changes status or labels, or gets a comment, Linear calls Maestro, which starts a run of every project that works with that team. A project is not woken while one of its runs is going.</p>
+    <p class="small">When an issue is created in a Linear project, changes status or labels, or gets a comment, Linear calls Maestro. Maestro only starts a run of the projects whose settings name that Linear project (for example <code>LINEAR_PROJECT</code>: its name, ID or URL); the other issues of the team are ignored. A project is not woken while one of its runs is going.</p>
     {% if linear_hook_url %}
     <label>Webhook URL <input value="{{ linear_hook_url }}" readonly onclick="this.select()"></label>
     <small class="help">In Linear (workspace admin): <strong>Settings → API → Webhooks → New webhook</strong>. Paste the URL, choose the team (or all public teams), tick <strong>Issues</strong> and <strong>Comments</strong>, then create it. Linear then shows a <strong>signing secret</strong>: paste it below.</small>
