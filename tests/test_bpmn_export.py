@@ -326,7 +326,7 @@ def test_the_owner_downloads_the_bpmn_and_sees_the_button(client, fake):
     wf_id = _create(client)
     _design(wf_id)
     page = client.get(f"/workflows/{wf_id}/design").text
-    assert f'href="/workflows/{wf_id}/design.bpmn"' in page and "Download BPMN" in page
+    assert f'href="/workflows/{wf_id}/design.bpmn"' in page and "Export BPMN" in page
     r = client.get(f"/workflows/{wf_id}/design.bpmn")
     assert r.status_code == 200 and r.headers["content-type"].startswith("application/xml")
     assert r.headers["content-disposition"] == 'attachment; filename="maestro-page-migration.bpmn"'

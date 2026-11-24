@@ -10,6 +10,12 @@
     {% endif %}
     {% if is_owner %}<a href="/workflows/{{ wf.id }}/edit" role="button" class="secondary">{{ icon('edit') }}Edit</a>{% endif %}
     <a href="/workflows/{{ wf.id }}/history" role="button" class="secondary">{{ icon('runs') }}Runs</a>
+    {% if is_owner and wf.design_status not in ['queued', 'generating'] and not (wf.design_status == 'needs_answers' and (wf.clarifications or {}).get('kind') == 'import_review') %}
+    <a href="/workflows/{{ wf.id }}/import-bpmn" role="button" class="secondary">{{ icon('upload') }}Import BPMN</a>
+    {% endif %}
+    {% if wf.design_status == 'ready' %}
+    <a href="/workflows/{{ wf.id }}/design.bpmn" role="button" class="secondary" download>{{ icon('download') }}Export BPMN</a>
+    {% endif %}
   </div>
 </header>
 
@@ -48,7 +54,6 @@
     <div class="maestro-svg" id="design-svg">{{ svg }}</div>
     <div class="row-actions" style="margin-top:.6rem">
       <a href="/workflows/{{ wf.id }}/design.svg" role="button" class="secondary" download>{{ icon('download') }}Download SVG</a>
-      <a href="/workflows/{{ wf.id }}/design.bpmn" role="button" class="secondary" download>{{ icon('download') }}Download BPMN</a>
     </div>
   </section>
 

@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Import BPMN into {{ wf.name }}{% endblock %}
+{% block content %}
+<nav aria-label="breadcrumb"><ul><li><a href="/workflows">Projects</a></li><li><a href="/workflows/{{ wf.id }}/design">{{ wf.name }}</a></li><li>Import BPMN</li></ul></nav>
+<h1>Update {{ wf.name }} from a BPMN file</h1>
+<div class="flash warning" role="status">This replaces the project's design. Settings you saved are kept for settings that still exist. Runs already started keep the design they started with.</div>
+<article>
+  <form method="post" action="/workflows/{{ wf.id }}/import-bpmn" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="bpmn-file"><strong>BPMN file</strong>
+      <input type="file" name="bpmn" id="bpmn-file" accept=".bpmn,application/xml,text/xml" required>
+    </label>
+    <small class="help">BPMN 2.0 file from Maestro or any BPMN tool (Camunda, Signavio, Bizagi). A file exported by Maestro and not changed is restored as is.</small>
+    <label for="context"><strong>What changed</strong>
+      <textarea name="context" id="context" rows="5" placeholder="Optional: what you changed in the diagram and why. Maestro uses it with the BPMN process."></textarea>
+    </label>
+    <div class="row-actions">
+      <button type="submit">{{ icon('upload') }}Import and update</button>
+      <a href="/workflows/{{ wf.id }}/design" role="button" class="secondary outline">{{ icon('back') }}Cancel</a>
+    </div>
+  </form>
+</article>
+{% endblock %}
