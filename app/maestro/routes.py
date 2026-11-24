@@ -290,6 +290,7 @@ def import_match_choose(
     pending_id: str,
     choice: str = Form(""),
     new_name: str = Form(""),
+    match_id: int | None = Form(None),
     user: User = Depends(require_configured),
     db: Session = Depends(get_db),
 ) -> Response:
@@ -299,14 +300,21 @@ def import_match_choose(
         return RedirectResponse("/maestro/new?start=bpmn", status_code=303)
     if choice == "update":
         match = service.find_matching_project(db, user, result, pending.name)
-        if match is not None:
-            wf = _maestro(db, match.workflow.id, user)  # the target is the matched project, owner only
-            if _update_blocker(wf):
-                return _match_page(request, db, user, pending, result, choice="update", status=400)
-            service.update_from_bpmn(db, wf, result, pending.context)
-            service.drop_pending_import(db, pending)
-            flash(request, "Project updated from the BPMN file." + _design_state(wf), "info")
-            return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+        if match is None:
+            return _match_page(request, db, user, pending, result, choice="create", status=400,
+                               error="The project to update is no longer there. "
+                                     "You can import the file as a new project.")
+        if match_id != match.workflow.id:  # the user confirmed another project than the one matched now
+            return _match_page(request, db, user, pending, result, choice="create", status=400,
+                               error="The project to update has changed since this page was shown. "
+                                     "Check the project below and choose again.")
+        wf = _maestro(db, match.workflow.id, user)  # the target is the matched project, owner only
+        if _update_blocker(wf):
+            return _match_page(request, db, user, pending, result, choice="update", status=400)
+        service.update_from_bpmn(db, wf, result, pending.context)
+        service.drop_pending_import(db, pending)
+        flash(request, "Project updated from the BPMN file." + _design_state(wf), "info")
+        return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
     elif choice == "create":
         new_name = new_name.strip()
         if not new_name or len(new_name) > 128:

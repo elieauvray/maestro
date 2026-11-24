@@ -27,6 +27,7 @@
   <form method="post" action="/maestro/import-match/{{ pending.id }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     {% if match %}
+    <input type="hidden" name="match_id" value="{{ match.workflow.id }}">
     <label class="option-card{% if update_blocker %} disabled{% endif %}" for="choice-update">
       <input type="radio" name="choice" id="choice-update" value="update"{% if preselect == 'update' %} checked{% endif %}{% if update_blocker %} disabled{% endif %}>
       <strong>Update {{ match.workflow.name }}</strong>
@@ -40,7 +41,7 @@
         <strong>Create a new project</strong>
       </label>
       <p>Import the file as a separate project.</p>
-      <input type="text" name="new_name" id="new-name" value="{{ proposed_name }}" required maxlength="128" aria-label="Name of the new project">
+      <input type="text" name="new_name" id="new-name" value="{{ proposed_name }}" maxlength="128" aria-label="Name of the new project">
     </div>
     <div class="row-actions">
       <button type="submit">{{ icon('continue') }}Continue</button>

@@ -127,6 +127,18 @@ def test_the_steps_rule_needs_a_ready_design(client, fake):
         assert service.find_matching_project(db, user, result, "x").reason == "steps"
 
 
+def test_a_file_without_steps_never_matches_by_steps(client, fake):
+    uid = make_user("bob")
+    with SessionLocal() as db:
+        user = db.get(User, uid)
+        empty = _wf(db, uid, "Empty design", design_json={"steps": []})
+        result = _result(steps_fingerprint=steps_hash([]))
+        assert service.find_matching_project(db, user, result, "x") is None
+        assert service.find_matching_project(db, user, _result(name="empty design", steps_fingerprint=steps_hash([])),
+                                             "x").reason == "name"  # the other rules still work
+        assert service.find_matching_project(db, user, _result(source_id=empty.id), "x").reason == "exported"
+
+
 def test_another_users_project_never_matches_even_when_shared(client, fake):
     bob = make_user("bob")
     carol = make_user("carol")
@@ -241,8 +253,55 @@ def test_the_page_still_works_when_the_match_is_gone(client, fake):
     page = client.get(f"/maestro/import-match/{pid}").text
     assert "Create a new project" in page and "Update " not in page
     assert "checked" in _card_input(page, "create")
-    r = _choose(client, pid, choice="update")
-    assert r.status_code == 400 and "Choose an option." in r.text
+    r = _choose(client, pid, choice="update", match_id=wf_id)
+    assert r.status_code == 400 and "The project to update is no longer there." in r.text
+    assert "Choose an option." not in r.text and "checked" in _card_input(r.text, "create")
+    assert _pending_ids() == [pid]
+
+
+def test_renaming_the_matched_project_after_the_page_was_shown_is_refused(client, fake):
+    _setup(client)
+    wf_id = _ready_project(client, fake)
+    pid = _to_match(client, CLEAN, name=PROJECT)  # a foreign file: matched by the typed name
+    assert f'name="match_id" value="{wf_id}"' in client.get(f"/maestro/import-match/{pid}").text
+    with SessionLocal() as db:
+        wf = db.get(Workflow, wf_id)
+        wf.name = "Renamed"
+        db.commit()
+        other_id = _wf(db, wf.user_id, PROJECT).id  # now this one matches the typed name
+        before = dict(db.get(Workflow, other_id).design_json)
+    r = _choose(client, pid, choice="update", match_id=wf_id)
+    assert r.status_code == 400 and "The project to update has changed since this page was shown." in r.text
+    assert f'name="match_id" value="{other_id}"' in r.text  # the page now shows the project that matches
+    assert 'checked' not in _card_input(r.text, "update")
+    assert _pending_ids() == [pid]
+    with SessionLocal() as db:
+        assert db.get(Workflow, other_id).design_json == before
+
+
+def test_the_page_carries_the_matched_project_id_and_the_name_is_not_required(client, fake):
+    _setup(client)
+    wf_id = _ready_project(client, fake)
+    pid = _to_match(client, _export(client, wf_id))
+    page = client.get(f"/maestro/import-match/{pid}").text
+    assert f'<input type="hidden" name="match_id" value="{wf_id}">' in page
+    name_input = re.search(r'<input[^>]*id="new-name"[^>]*>', page).group(0)
+    assert "required" not in name_input and 'maxlength="128"' in name_input
+
+
+def test_updating_without_or_with_a_wrong_match_id_is_refused(client, fake):
+    _setup(client)
+    wf_id = _ready_project(client, fake)
+    pid = _to_match(client, _export(client, wf_id))
+    for data in ({}, {"match_id": wf_id + 1000}):
+        r = _choose(client, pid, choice="update", **data)
+        assert r.status_code == 400 and "has changed since this page was shown" in r.text
+        assert "checked" not in _card_input(r.text, "update")  # even for an exported file: confirm again
+        assert "checked" in _card_input(r.text, "create")
+    assert _pending_ids() == [pid]
+    with SessionLocal() as db:
+        assert db.get(Workflow, wf_id).design_status == "ready"
+    assert _choose(client, pid, choice="update", match_id=wf_id).status_code == 303
 
 
 # --- Update -----------------------------------------------------------------------------------------------------
@@ -255,7 +314,7 @@ def test_updating_an_unchanged_export_restores_the_same_project_without_any_call
     xml = _export(client, wf_id)
     calls = (len(fake.design_calls), _calls(fake))
     pid = _to_match(client, xml)
-    r = _choose(client, pid, choice="update")
+    r = _choose(client, pid, choice="update", match_id=wf_id)
     assert r.status_code == 303 and r.headers["location"] == f"/workflows/{wf_id}/design"
     assert (len(fake.design_calls), _calls(fake)) == calls
     assert _pending_ids() == []
@@ -273,7 +332,7 @@ def test_updating_with_another_file_queues_the_review_and_keeps_the_settings(cli
     wf_id = _ready_project(client, fake)
     pid = _to_match(client, CLEAN, name=PROJECT)
     before = _calls(fake)
-    r = _choose(client, pid, choice="update")
+    r = _choose(client, pid, choice="update", match_id=wf_id)
     assert r.status_code == 303 and r.headers["location"] == f"/workflows/{wf_id}/design"
     assert _calls(fake) == before and _pending_ids() == []
     with SessionLocal() as db:
@@ -300,7 +359,7 @@ def test_the_update_card_is_disabled_while_the_project_is_busy_or_in_review(clie
         page = client.get(f"/maestro/import-match/{pid}").text
         assert "disabled" in _card_input(page, "update") and reason in page
         assert "checked" in _card_input(page, "create")  # exported, but update is not possible now
-        r = _choose(client, pid, choice="update")
+        r = _choose(client, pid, choice="update", match_id=wf_id)
         assert r.status_code == 400 and reason in r.text
         with SessionLocal() as db:
             assert db.get(Workflow, wf_id).design_status == values["design_status"]  # untouched
@@ -420,8 +479,37 @@ def test_an_expired_file_is_a_404_and_saving_purges_the_old_rows(client, fake):
         db.get(PendingBpmnImport, old).created_at = utcnow() - timedelta(hours=2)
         db.commit()
     _all_404(client, old)
-    fresh = _to_match(client, xml)  # saving deletes this user's expired rows
+    fresh = _to_match(client, xml)  # saving deletes the expired rows
     assert _pending_ids() == [fresh]
+
+
+def test_saving_purges_the_expired_rows_of_every_user(client, fake):
+    _setup(client)
+    wf_id = _ready_project(client, fake)
+    carol = make_user("carol")
+    with SessionLocal() as db:
+        db.add(PendingBpmnImport(id="carol-old", user_id=carol, xml=b"<x/>", name="", context="", shared=False,
+                                 created_at=utcnow() - timedelta(hours=2)))
+        db.add(PendingBpmnImport(id="carol-new", user_id=carol, xml=b"<x/>", name="", context="", shared=False,
+                                 created_at=utcnow()))
+        db.commit()
+    fresh = _to_match(client, _export(client, wf_id))
+    assert sorted(_pending_ids()) == sorted(["carol-new", fresh])
+
+
+def test_a_user_keeps_only_the_newest_pending_files(client, fake):
+    uid = make_user("bob")
+    carol = make_user("carol")
+    cap = service.PENDING_MAX_PER_USER
+    with SessionLocal() as db:
+        db.add(PendingBpmnImport(id="carol-1", user_id=carol, xml=b"<x/>", name="", context="", shared=False,
+                                 created_at=utcnow()))
+        db.commit()
+        user = db.get(User, uid)
+        ids = [service.save_pending_import(db, user, b"<x/>", f"n{i}", "", False) for i in range(cap + 2)]
+        kept = set(db.scalars(select(PendingBpmnImport.id).where(PendingBpmnImport.user_id == uid)))
+        assert kept == set(ids[-cap:])
+        assert db.get(PendingBpmnImport, "carol-1") is not None  # another user's rows are not counted
 
 
 def test_the_match_page_is_login_protected(client, fake):
