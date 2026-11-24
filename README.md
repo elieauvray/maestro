@@ -67,12 +67,13 @@ lives in a "ledger" (an edited comment) on each tracked item.
 1. [Architecture](#architecture)
 2. [BPMN 2.0 import](#bpmn-20-import)
 3. [BPMN 2.0 export](#bpmn-20-export)
-4. [Local setup](#local-setup)
-5. [Deploying on Upsun](#deploying-on-upsun)
-6. [Connector configuration](#connector-configuration)
-7. [Security](#security)
-8. [Tests](#tests)
-9. [Known limitations](#known-limitations)
+4. [Updating a project from a BPMN file](#updating-a-project-from-a-bpmn-file)
+5. [Local setup](#local-setup)
+6. [Deploying on Upsun](#deploying-on-upsun)
+7. [Connector configuration](#connector-configuration)
+8. [Security](#security)
+9. [Tests](#tests)
+10. [Known limitations](#known-limitations)
 
 ## Architecture
 
@@ -238,7 +239,7 @@ intermediate and end events. A file written by Maestro also carries its design i
 
 ## BPMN 2.0 export
 
-The design page has a **Download BPMN** button next to *Download SVG*: `GET /workflows/{id}/design.bpmn` returns the
+The design page has an **Export BPMN** button in the header, next to *Run now*, *Edit*, *Runs* and *Import BPMN*: `GET /workflows/{id}/design.bpmn` returns the
 design as a BPMN 2.0 file with diagram interchange (DI), named `maestro-<project>.bpmn`. It opens in bpmn.io, Camunda
 Modeler, Signavio and Bizagi with the lanes, tasks, gateways and flows laid out. Access is the same as for
 `design.svg` (the owner, or anyone who can view a shared project; a design that is not ready gives a 404).
@@ -277,6 +278,32 @@ cannot be rebuilt exactly from the BPMN elements: such a file goes through the i
 phase bands, the branch paths and the loops. The SVG draws from it (its output is unchanged) and the BPMN diagram uses
 the same structure in BPMN units: lanes are horizontal bands, a node's x follows the flow, the paths of a branch stack
 in sub-rows of their lane, and loop routes run under the last lane. Shapes have the usual BPMN sizes.
+
+## Updating a project from a BPMN file
+
+On a project's page, **Import BPMN** and **Export BPMN** sit on the same line as *Run now*, *Edit* and *Runs*, so the
+round trip happens where the project is managed: export the diagram, rework it in Camunda Modeler or Signavio, then
+import it back. *Import BPMN* is for the owner only and is hidden while the design is queued or being generated;
+*Export BPMN* shows once the design is ready (same access as before: the owner, or anyone who can view a shared
+project).
+
+*Import BPMN* opens `GET /workflows/{id}/import-bpmn`: a BPMN file, an optional **What changed** text, and an
+**Import and update** button (`POST /workflows/{id}/import-bpmn`, multipart, with the CSRF token). The project stays
+the same: id, name, sharing and run history are kept, and only the design is replaced. There is no new parser and no
+new Anthropic call:
+
+- **An unchanged Maestro export** is restored as it was, with no call. The settings you saved are kept for the keys
+  that still exist and are empty in the restored design.
+- **Any other file** goes through the same import review and designer as a new import. The settings saved so far are
+  carried over (`clarifications["previous_config"]`, dropped once applied): the new design keeps their values for the
+  keys it still has, through the review dialog and the questions too.
+- **What changed** is put before the imported process in the description (`## Context from the user`, then
+  `## Imported BPMN process`), so the review and the designer read both. Left empty, only the process is stored.
+- An invalid file returns to the update page with the error and changes nothing. While the import review dialog is
+  open, the dialog's own *Import a corrected file* form is used instead.
+
+Runs already started keep the design they started with (`design_snapshot`): updating a project never touches them.
+There is no undo: the previous design and the decisions made for it are replaced.
 
 ## Local setup
 
@@ -473,6 +500,7 @@ TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/dispatch_test pytest -q
 ## Known limitations
 
 - **BPMN import**: a Maestro file is restored as is only when its steps are unchanged; any edit sends it through the review. The routes chosen in the review are not written back to a BPMN file (the next export reflects the new design), and there is no in-app BPMN editor.
+- **Updating from a BPMN file**: the new design replaces the old one (no undo), and runs already started keep their snapshot of the design they started with. Name and sharing are not changed from the update page (use *Edit*).
 - **BPMN export**: the file is meant for exchange and governance, not for execution (`isExecutable="false"`). The layout is computed, not hand-drawn: very large designs with many parallel branch paths or loops give tall lanes, and there is no XSD validation in the tests: check a new kind of design by opening the file in a BPMN tool.
 - **Question detection**: heuristic, the last line of Claude's message must end with "?". In any case, the user can continue the conversation.
 - **Atlassian with a static token**: personal API tokens (Basic `email:token`) are not compatible with `static_bearer`. Use OAuth or a service account key.

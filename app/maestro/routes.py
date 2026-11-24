@@ -155,25 +155,56 @@ def maestro_import_bpmn(request: Request, user: User = Depends(require_configure
     return RedirectResponse("/maestro/new?start=bpmn", status_code=303)
 
 
+_BUSY = {"queued", "generating"}
+_BUSY_MESSAGE = "Wait until the current design is finished."
+
+
+@router.get("/workflows/{workflow_id}/import-bpmn")
+def update_bpmn_page(
+    request: Request, workflow_id: int, user: User = Depends(require_configured), db: Session = Depends(get_db)
+) -> Response:
+    """Update the project from a BPMN file (owner only)."""
+    wf = _maestro(db, workflow_id, user)
+    if _in_import_review(wf):  # the review dialog has its own "Import a corrected file" form
+        return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+    if wf.design_status in _BUSY:
+        flash(request, _BUSY_MESSAGE, "info")
+        return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+    return render(request, "maestro_update_bpmn.html", {"wf": wf})
+
+
 @router.post("/workflows/{workflow_id}/import-bpmn", dependencies=[Depends(csrf_protect)])
 async def design_reimport_bpmn(
     request: Request,
     workflow_id: int,
     bpmn: UploadFile | None = File(None),
+    context: str = Form(""),
     user: User = Depends(require_configured),
     db: Session = Depends(get_db),
 ) -> Response:
     wf = _maestro(db, workflow_id, user)
-    if not _in_import_review(wf):
+    if _in_import_review(wf):  # "Import a corrected file" in the review dialog
+        try:
+            result = await _read_bpmn(bpmn)
+        except BpmnImportError as exc:  # the workflow and its dialog stay as they were
+            flash(request, str(exc), "error")
+            return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+        service.reimport_workflow(db, wf, result)
+        flash(request, "Corrected file imported." + (" Your design is restored." if wf.design_status == "ready"
+                                                    else " Maestro is reviewing it again."), "info")
+        return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+    if wf.design_status in _BUSY:
+        flash(request, _BUSY_MESSAGE, "info")
         return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
     try:
         result = await _read_bpmn(bpmn)
-    except BpmnImportError as exc:  # the workflow and its dialog stay as they were
+    except BpmnImportError as exc:  # the project stays as it was
         flash(request, str(exc), "error")
-        return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
-    service.reimport_workflow(db, wf, result)
-    flash(request, "Corrected file imported." + (" Your design is restored." if wf.design_status == "ready"
-                                                else " Maestro is reviewing it again."), "info")
+        return RedirectResponse(f"/workflows/{wf.id}/import-bpmn", status_code=303)
+    service.update_from_bpmn(db, wf, result, context.strip())
+    flash(request, "Project updated from the BPMN file." + (" Your design is restored."
+                                                          if wf.design_status == "ready"
+                                                          else " Maestro is reviewing it."), "info")
     return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
 
 

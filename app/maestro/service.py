@@ -123,10 +123,44 @@ def reimport_workflow(db: Session, wf: Workflow, result: ImportResult) -> None:
     head, sep, _ = (wf.description or "").partition("\n\n## Imported BPMN process\n")
     # Keep the context typed on the Create page: a corrected file replaces the process only.
     wf.description = f"{head}{sep}{process}" if sep and head.startswith("## Context from the user\n") else process
+    _apply_import(db, wf, result, _saved_config(wf))
+    db.commit()
+
+
+def _saved_config(wf: Workflow) -> list[dict[str, Any]]:
+    """The non-empty config values to carry over: the design's, else those already carried by an earlier import."""
+    values = [{"key": c["key"], "value": c["value"]}
+              for c in (wf.design_json or {}).get("config") or [] if c.get("key") and c.get("value")]
+    return values or list((wf.clarifications or {}).get("previous_config") or [])
+
+
+def _apply_import(db: Session, wf: Workflow, result: ImportResult, saved: list[dict[str, Any]]) -> None:
+    """Restore an unchanged Maestro export or queue any other file, keeping the saved config values."""
     if result.kind == "maestro":
         _restore_export(db, wf, result)
+        if saved:
+            values = {c["key"]: c["value"] for c in saved}
+            design = dict(wf.design_json or {})
+            design["config"] = [
+                {**c, "value": c.get("value") or values.get(c.get("key"), "")} for c in design.get("config") or []
+            ]
+            wf.design_json = design
     else:
         _queue_import(wf, result)
+        if saved:
+            wf.clarifications = {**(wf.clarifications or {}), "previous_config": saved}
+
+
+def update_from_bpmn(db: Session, wf: Workflow, result: ImportResult, context: str = "") -> None:
+    """Update the same project from a BPMN file: name, sharing, owner and runs stay; the design is replaced.
+
+    An unchanged Maestro export is restored as it was (no Anthropic call). Any other file goes through the
+    review and the designer; the settings saved so far are kept in `clarifications["previous_config"]` and
+    applied for the keys that still exist when the new design is normalized.
+    """
+    process = result.description or "Imported from a BPMN file."
+    wf.description = f"## Context from the user\n{context}\n\n## Imported BPMN process\n{process}" if context else process
+    _apply_import(db, wf, result, _saved_config(wf))
     db.commit()
 
 
@@ -566,13 +600,17 @@ def review_import(db: Session, wf: Workflow, client: Any, settings: Any, instruc
                   services: list[str]) -> bool:
     """Review an imported BPMN file. True when the dialog must be shown (status set to needs_answers)."""
     findings = list((wf.clarifications or {}).get("findings") or [])
+    # Settings carried over from before an update of the project (applied when the design is normalized).
+    carried = {"previous_config": (wf.clarifications or {})["previous_config"]} \
+        if (wf.clarifications or {}).get("previous_config") else {}
     raw = client.review_import(settings.model, wf.description, findings, services, CONNECTOR_KEYS, instructions)
     issues = normalize_issues(raw.get("issues") or [], findings)
     if not issues:
-        wf.clarifications = None  # nothing to decide: straight on to the tool check
+        wf.clarifications = carried or None  # nothing to decide: straight on to the tool check
         db.commit()
         return False
-    wf.clarifications = {"kind": "import_review", "questions": issues, "findings": findings, "decisions": []}
+    wf.clarifications = {"kind": "import_review", "questions": issues, "findings": findings, "decisions": [],
+                         **carried}
     wf.design_status = "needs_answers"
     wf.design_error = None
     wf.design_updated_at = utcnow()
@@ -623,7 +661,8 @@ def generate_design(db: Session, wf_id: int) -> None:
             _start_stage(db, wf, "clarify")
             asked = client.clarify_workflow(settings.model, text + decisions_block(clar), services, instructions, diagram)
             questions = normalize_questions(asked.get("questions") or [])
-            clar = {"for": request_hash, "questions": questions, "decisions": clar.get("decisions") or []}
+            carried = {"previous_config": clar["previous_config"]} if clar.get("previous_config") else {}
+            clar = {"for": request_hash, "questions": questions, "decisions": clar.get("decisions") or [], **carried}
             wf.clarifications = clar
         else:  # already asked for this request (answered or nothing to ask): not asked again
             _skip_stage(wf, "clarify", "Already answered" if clar.get("decisions") else "Nothing to ask")
@@ -649,7 +688,11 @@ def generate_design(db: Session, wf_id: int) -> None:
             wf.design_json, wf.design_feedback, instructions, diagram, on_progress=on_progress,
         )
         _finish_generation(db, wf, written["chars"] or None)
-        wf.design_json = {**_normalize_design(raw, wf.design_json), "connectors_needed": needed}
+        carried_config = clar.get("previous_config")
+        previous = {"config": carried_config} if carried_config else wf.design_json
+        wf.design_json = {**_normalize_design(raw, previous), "connectors_needed": needed}
+        if carried_config:  # applied: dropped (a new dict, so the JSON column notices)
+            wf.clarifications = {k: v for k, v in clar.items() if k != "previous_config"}
         wf.content = str(raw["orchestration_prompt"]).strip()
         wf.design_status = "ready"
         wf.design_error = None
