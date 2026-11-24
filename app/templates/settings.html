@@ -189,6 +189,29 @@
   </details>
   {% endif %}
 
+  {% if key == 'atlassian' %}
+  <details class="card fold" id="jira-webhook" {% if new_jira_secret or not jira_hook_url %}open{% endif %}>
+    <summary>Wake-up on new or changed requests <span class="badge {{ 'configured' if jira_hook_url else 'not_configured' }}">{{ 'On' if jira_hook_url else 'Off' }}</span></summary>
+    {{ section_flashes('jira-webhook') }}
+    <p class="small">When a request is created in Jira, changes status, labels or resolution, or gets a comment, Jira calls Maestro, which starts a run of every project that works with that Jira project. A project is not woken while one of its runs is going.</p>
+    {% if jira_hook_url %}
+    <label>Webhook URL <input value="{{ jira_hook_url }}" readonly onclick="this.select()"></label>
+    {% if new_jira_secret %}<label>Secret (shown once) <input value="{{ new_jira_secret }}" readonly onclick="this.select()"></label>{% endif %}
+    <small class="help">In Jira (admin): <strong>Settings → System → WebHooks → Create a WebHook</strong>. Paste the URL and the secret, limit it with JQL to your project (for example <code>project = ELI</code>), tick <strong>Issue: created, updated</strong> and <strong>Comment: created</strong>, then save.</small>
+    <div class="row-actions">
+      <form method="post" action="/settings/jira-webhook" onsubmit='return confirm("Generate a new URL and secret? The current Jira webhook will stop working until you update it.")'>
+        {{ csrf() }}<button type="submit" class="secondary">{{ icon('refresh') }}Regenerate</button>
+      </form>
+      <form method="post" action="/settings/jira-webhook/delete" onsubmit='return confirm("Turn off the Jira wake-up?")'>
+        {{ csrf() }}<button type="submit" class="secondary outline">{{ icon('pause') }}Turn off</button>
+      </form>
+    </div>
+    {% else %}
+    <form method="post" action="/settings/jira-webhook">{{ csrf() }}<button type="submit" class="secondary">{{ icon('webhook') }}Create the webhook</button></form>
+    {% endif %}
+  </details>
+  {% endif %}
+
   {% if current_user.is_admin %}
   <details class="card fold" id="oauth-app-{{ key }}" {% if flashes | selectattr('section', 'equalto', 'oauth-app-' ~ key) | list %}open{% endif %}>
     <summary>OAuth app <span class="badge">admin</span> <span class="badge {{ 'configured' if app else 'not_configured' }}">{{ ('Registered automatically' if app.dynamic else 'Configured') if app else 'Not set up' }}</span></summary>

@@ -1,4 +1,5 @@
-"""Incoming webhooks: Anthropic (verified by the SDK), GitHub (merged PRs) and Linear (new or changed requests)."""
+"""Incoming webhooks: Anthropic (verified by the SDK), GitHub (merged PRs), Linear and Jira (new or changed
+requests)."""
 
 from __future__ import annotations
 
@@ -165,3 +166,68 @@ async def linear_webhook(hook_id: str, request: Request, db: Session = Depends(g
     woken = await run_in_threadpool(wake_for_linear, db, user, teams, why)
     log.info("Linear: %s, %d project(s) woken", why, len(woken))
     return JSONResponse({"teams": sorted(teams), "woken_workflows": woken}, status_code=202)
+
+
+# --- Jira: wake the projects of a Jira project when a request is created or changes -------
+
+JIRA_MAX_AGE_MS = 600_000  # Jira retries failed deliveries: accept a signed call up to 10 minutes old
+JIRA_FIELDS = {"status", "labels", "resolution"}
+
+
+def _jira_hints(payload: dict[str, Any]) -> set[str]:
+    """Ways a project may name the issue's Jira project: key (from "ELI-21" too), name, id."""
+    issue = payload.get("issue") or {}
+    hints: set[str] = set()
+    project = ((issue.get("fields") or {}).get("project")) or {}
+    if isinstance(project, dict):
+        hints.update(str(project.get(k) or "") for k in ("key", "name", "id"))
+    m = re.match(r"^([A-Za-z][A-Za-z0-9_]*)-\d+$", str(issue.get("key") or ""))
+    if m:
+        hints.add(m.group(1))
+    return {h for h in hints if h}
+
+
+def jira_wake_reason(payload: dict[str, Any]) -> str | None:
+    """Why this Jira event should wake the projects of its Jira project (None: ignore it)."""
+    event, key = payload.get("webhookEvent"), (payload.get("issue") or {}).get("key") or ""
+    if event == "jira:issue_created":
+        return f"new Jira issue {key}".strip()
+    if event == "jira:issue_updated":
+        items = (payload.get("changelog") or {}).get("items") or []
+        if any(str(i.get("field") or "").lower() in JIRA_FIELDS for i in items if isinstance(i, dict)):
+            return f"Jira issue {key} changed".strip()
+        return None
+    if event == "comment_created":
+        return f"new comment on Jira issue {key}".strip()
+    return None
+
+
+@router.post("/webhooks/jira/{hook_id}")
+async def jira_webhook(hook_id: str, request: Request, db: Session = Depends(get_db)) -> Response:
+    settings = db.scalar(select(UserSettings).where(UserSettings.jira_hook_id == hook_id)) if hook_id else None
+    if settings is None or not settings.jira_hook_secret_encrypted:
+        raise HTTPException(status_code=404)
+    body = await request.body()
+    # Same scheme as GitHub: "sha256=<hex HMAC of the raw body>", here in X-Hub-Signature.
+    if not github_signature_ok(decrypt(settings.jira_hook_secret_encrypted), body,
+                               request.headers.get("x-hub-signature")):
+        raise HTTPException(status_code=401, detail="Invalid signature.")
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON.") from None
+    sent = payload.get("timestamp")
+    if isinstance(sent, (int, float)) and abs(time.time() * 1000 - sent) > JIRA_MAX_AGE_MS:
+        raise HTTPException(status_code=400, detail="Stale timestamp.")
+    why = jira_wake_reason(payload)
+    if why is None:
+        return JSONResponse({"ignored": str(payload.get("webhookEvent"))})
+    projects = _jira_hints(payload)
+    user = db.get(User, settings.user_id)
+    if not projects or user is None:
+        return JSONResponse({"ignored": "no project"})
+    from app.maestro.service import wake_for_jira
+
+    woken = await run_in_threadpool(wake_for_jira, db, user, projects, why)
+    log.info("Jira: %s, %d project(s) woken", why, len(woken))
+    return JSONResponse({"projects": sorted(projects), "woken_workflows": woken}, status_code=202)

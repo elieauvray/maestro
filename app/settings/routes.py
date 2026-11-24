@@ -77,6 +77,11 @@ def settings_page(
                 if settings.linear_hook_id else None
             ),
             "linear_hook_ready": bool(settings.linear_hook_id and settings.linear_hook_secret_encrypted),
+            "jira_hook_url": (
+                f"{get_settings().public_base_url}/webhooks/jira/{settings.jira_hook_id}"
+                if settings.jira_hook_id else None
+            ),
+            "new_jira_secret": request.session.pop("new_jira_secret", None),
         },
     )
 
@@ -338,6 +343,36 @@ def linear_webhook_delete(
     db.commit()
     flash(request, "Linear wake-up turned off. Delete the webhook in Linear too.", "success", section="linear-webhook")
     return _back("linear-webhook")
+
+
+# --- Jira webhook (wakes Maestro when a request is created or changes) -----------
+
+
+@router.post("/settings/jira-webhook", dependencies=[Depends(csrf_protect)])
+def jira_webhook_generate(
+    request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)
+) -> Response:
+    settings = get_user_settings(db, user)
+    secret = secrets.token_urlsafe(32)
+    settings.jira_hook_id = secrets.token_urlsafe(24)
+    settings.jira_hook_secret_encrypted = encrypt(secret)
+    db.commit()
+    request.session["new_jira_secret"] = secret  # shown once on the next page, never stored in clear
+    flash(request, "Jira webhook created. Copy the secret now: it will not be shown again.", "success",
+          section="jira-webhook")
+    return _back("jira-webhook")
+
+
+@router.post("/settings/jira-webhook/delete", dependencies=[Depends(csrf_protect)])
+def jira_webhook_delete(
+    request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)
+) -> Response:
+    settings = get_user_settings(db, user)
+    settings.jira_hook_id = None
+    settings.jira_hook_secret_encrypted = None
+    db.commit()
+    flash(request, "Jira wake-up turned off. Delete the webhook in Jira too.", "success", section="jira-webhook")
+    return _back("jira-webhook")
 
 
 # --- OAuth apps (admin) ---------------------------------------------

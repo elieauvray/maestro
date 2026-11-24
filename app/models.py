@@ -109,6 +109,9 @@ class UserSettings(Base):
     # Linear wake-up: the URL id Maestro gives, and the signing secret Linear shows (encrypted)
     linear_hook_id: Mapped[str | None] = mapped_column(String(48), index=True, unique=True)
     linear_hook_secret_encrypted: Mapped[str | None] = mapped_column(Text)
+    # Jira wake-up: the URL id and the secret Maestro generates for the Jira webhook (encrypted)
+    jira_hook_id: Mapped[str | None] = mapped_column(String(48), index=True, unique=True)
+    jira_hook_secret_encrypted: Mapped[str | None] = mapped_column(Text)
 
     user: Mapped[User] = relationship(back_populates="settings")
 

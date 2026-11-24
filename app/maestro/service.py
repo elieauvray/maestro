@@ -1028,7 +1028,7 @@ def wake_for_repo(db: Session, user: User, repo: str) -> list[int]:
 
 
 def _mentions_team(wf: Workflow, teams: set[str]) -> bool:
-    """The project works with one of these Linear teams (key, name or id, as a whole word)."""
+    """The project works with one of these Linear teams or Jira projects (key, name or id, as a whole word)."""
     values = " ".join(str(c.get("value") or "") for c in (wf.design_json or {}).get("config") or [])
     haystack = " ".join([wf.content or "", wf.description or "", values])
     return any(re.search(r"(?<![A-Za-z0-9])" + re.escape(t) + r"(?![A-Za-z0-9])", haystack, re.IGNORECASE)
@@ -1038,3 +1038,8 @@ def _mentions_team(wf: Workflow, teams: set[str]) -> bool:
 def wake_for_linear(db: Session, user: User, teams: set[str], why: str) -> list[int]:
     """Linear: a request was created or changed (status, labels, comment) in one of these teams."""
     return _wake(db, user, lambda wf: _mentions_team(wf, teams), why)
+
+
+def wake_for_jira(db: Session, user: User, projects: set[str], why: str) -> list[int]:
+    """Jira: a request was created or changed (status, labels, resolution, comment) in one of these projects."""
+    return _wake(db, user, lambda wf: _mentions_team(wf, projects), why)
