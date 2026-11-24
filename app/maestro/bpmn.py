@@ -80,6 +80,9 @@ class ImportResult:
     description: str
     design: dict[str, Any] | None = None
     findings: list[dict[str, str]] = field(default_factory=list)
+    # Facts used to find the user's existing project this file comes from (or looks like)
+    source_id: int | None = None  # id of the exporting project, from the process id "Process_<id>"
+    steps_fingerprint: str | None = None  # steps_hash() of the steps rebuilt from the file
 
 
 def steps_hash(steps: list[dict[str, Any]]) -> str:
@@ -494,16 +497,25 @@ def bpmn_to_design(xml: bytes | str) -> ImportResult:
     name = (_clip(processes[0].get("name"), 128) or (_clip(participant.get("name"), 128) if participant is not None
             else "") or _clip(root.get("name"), 128) or "Imported BPMN process")
     stored = _stored_design(root)
+    try:
+        rebuilt = steps_from_bpmn(root, ids)
+    except Exception:  # noqa: BLE001 - the fingerprint is only a hint for the match with an existing project
+        rebuilt = None
+    fingerprint = steps_hash(rebuilt) if rebuilt is not None else None
+    source_id = None
+    if stored is not None and processes:
+        found = re.fullmatch(r"Process_(\d+)", processes[0].get("id") or "")
+        source_id = int(found.group(1)) if found else None
     if stored and not findings and _is_untouched_export(root, ids):
         data, declared = stored
         design = data["design"]
         stored_steps = design.get("steps")
-        rebuilt = steps_from_bpmn(root, ids)
         if (isinstance(stored_steps, list) and rebuilt is not None and design.get("orchestration_prompt")
                 and steps_hash(rebuilt) == declared == steps_hash(stored_steps)):
             return ImportResult("maestro", _clip(str(data.get("name") or ""), 128) or name,
-                                str(data.get("description") or ""), design, [])
-    return ImportResult("foreign", name, build_description(root, ids, findings), None, findings)
+                                str(data.get("description") or ""), design, [], source_id, fingerprint)
+    return ImportResult("foreign", name, build_description(root, ids, findings), None, findings,
+                        source_id, fingerprint)
 
 
 # --- Export: stored design to BPMN 2.0 with diagram interchange ------------------------------------------

@@ -180,15 +180,44 @@ Shared choice); `start=bpmn` selects the import. The old `/maestro/import-bpmn` 
 BPMN mode.
 
 In BPMN mode you give:
-- the **Name** of the project. It is used as typed (a name you already use is an error; the process name in the file
-  is no longer used);
+- the **Name** of the project. It is used as typed (the process name in the file is no longer used). A name you
+  already use is not an error: it makes the file match your project, and you choose what to do (see *Existing
+  project detection* below);
 - the **BPMN file** (`.bpmn`);
 - a required **Context** (at least 40 characters): why the project exists, who is involved, tools, constraints and
   what the diagram does not say. It is stored with the project, as `## Context from the user` before
   `## Imported BPMN process`, so the import review and the designer both read it.
 
-Any error (name, context, file, taken name) returns to *Create* in BPMN mode with the name, context and Private /
+Any error (name, context, file) returns to *Create* in BPMN mode with the name, context and Private /
 Shared choice kept; choose the file again, since browsers do not keep file inputs.
+
+### Existing project detection
+
+Before creating anything, Maestro checks, with no LLM and no Anthropic call, whether the file matches one of **your
+own** projects (projects shared with you are never candidates: updating requires ownership). Three rules apply in
+order and the first hit wins; within a rule the project with the most recent design date (or the highest id) is taken:
+
+1. **`exported`**: the file has a `maestro:design` block (changed or not) and its process id `Process_<id>` is the id
+   of one of your projects ("It was exported from *project*.").
+2. **`name`**: a project name equals, case-insensitively and trimmed, the name you typed or the process name in the
+   file ("It has the same name as *project*.").
+3. **`steps`**: the steps rebuilt from the file have the same fingerprint (`steps_hash`) as the steps of one of your
+   `ready` designs ("It has the same steps as *project*.").
+
+On a match nothing is created yet. The uploaded file, the name, the context and the Private / Shared choice are kept
+in the `pending_bpmn_imports` table (migration `0013`) and you are sent to `/maestro/import-match/{id}`:
+"This BPMN file looks like an existing project". The page offers two choices:
+- **Update *project*** runs exactly the flow of *Import BPMN* on the project's page (see *Updating a project from a
+  BPMN file*): same project, saved settings kept, runs untouched, the review dialog when needed. It is disabled
+  while the design is being made or an import review is open. It is preselected for an `exported` match.
+- **Create a new project** imports the file as a separate project, under a proposed name (for example "TMA (2)") that
+  you can edit and must confirm. It is preselected for the `name` and `steps` matches.
+
+*Cancel* drops the pending file and returns to the Create page. The file is parsed again, with the same parser and
+2 MB limit, each time the page is shown or answered. A pending file expires after 1 hour (a 404 for its id); a user's
+expired files are deleted the next time that user saves one, so a file abandoned by someone who never comes back stays
+in the table. Without a match, the import creates the project directly, as before. *Import BPMN* on a project's page
+never shows this choice.
 
 A `.bpmn` file from Maestro or any BPMN tool is imported as a project. **Maestro does not execute BPMN**: the file is
 an input to the design. No LLM ever reads or writes the XML; parsing is deterministic (`app/maestro/bpmn.py`).

@@ -7,18 +7,20 @@ import logging
 import re
 import statistics
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.anthropic_client import ManagedAgentsError
-from app.maestro.bpmn import ImportResult
+from app.maestro.bpmn import ImportResult, steps_hash
 from app.maestro.knowledge import CONNECTOR_KEYS, CONNECTOR_NAMES
 from app.deps import get_user_settings
-from app.models import RunStatus, Skill, User, Workflow, WorkflowRun, utcnow
+from app.models import PendingBpmnImport, RunStatus, Skill, User, Workflow, WorkflowRun, utcnow
 from app.plans.service import connector_policies
 from app.settings.service import client_for, resources_ready, sync_user_resources
 from app.maestro.diagram import fingerprint
@@ -161,6 +163,79 @@ def update_from_bpmn(db: Session, wf: Workflow, result: ImportResult, context: s
     process = result.description or "Imported from a BPMN file."
     wf.description = f"## Context from the user\n{context}\n\n## Imported BPMN process\n{process}" if context else process
     _apply_import(db, wf, result, _saved_config(wf))
+    db.commit()
+
+
+# --- Existing project detection (Create page, BPMN file) ----------------------------------------
+
+
+@dataclass
+class ProjectMatch:
+    workflow: Workflow
+    reason: str  # "exported" | "name" | "steps"
+
+
+def _freshest(candidates: list[Workflow]) -> Workflow | None:
+    """The most recently designed project, or the highest id when none has a design date."""
+    floor = datetime.min.replace(tzinfo=UTC)
+    return max(candidates, key=lambda w: (_aware(w.design_updated_at) if w.design_updated_at else floor, w.id),
+               default=None)
+
+
+def find_matching_project(db: Session, user: User, result: ImportResult, typed_name: str) -> ProjectMatch | None:
+    """The user's own project a BPMN file comes from or looks like (no LLM): exported, same name, same steps."""
+    own = list(db.scalars(select(Workflow).where(Workflow.user_id == user.id, Workflow.description.is_not(None))))
+    if result.source_id is not None:
+        hit = _freshest([w for w in own if w.id == result.source_id])
+        if hit:
+            return ProjectMatch(hit, "exported")
+    names = {n.strip().casefold() for n in (typed_name, result.name) if n and n.strip()}
+    if names:
+        hit = _freshest([w for w in own if w.name.strip().casefold() in names])
+        if hit:
+            return ProjectMatch(hit, "name")
+    if result.steps_fingerprint is not None:
+        hit = _freshest([w for w in own if w.design_status == "ready"
+                         and steps_hash((w.design_json or {}).get("steps") or []) == result.steps_fingerprint])
+        if hit:
+            return ProjectMatch(hit, "steps")
+    return None
+
+
+def proposed_name(db: Session, user: User, base: str) -> str:
+    """`base` when the user has no project with that name, else the first free "base (2)", "base (3)"..."""
+    taken = set(db.scalars(select(Workflow.name).where(Workflow.user_id == user.id)))
+    if base.strip() and base.strip() not in taken and len(base.strip()) <= 128:
+        return base.strip()
+    return _unique_name(base, taken)
+
+
+# --- Pending import: the file kept on the server until the user chooses -------------------------
+
+PENDING_TTL = timedelta(hours=1)
+
+
+def save_pending_import(db: Session, user: User, xml: bytes, name: str, context: str, shared: bool) -> str:
+    """Keep the uploaded file for the choice page; this user's expired files are deleted first."""
+    db.execute(delete(PendingBpmnImport).where(PendingBpmnImport.user_id == user.id,
+                                               PendingBpmnImport.created_at < utcnow() - PENDING_TTL))
+    row = PendingBpmnImport(id=str(uuid4()), user_id=user.id, xml=xml, name=name, context=context,
+                            shared=shared, created_at=utcnow())
+    db.add(row)
+    db.commit()
+    return row.id
+
+
+def load_pending_import(db: Session, user: User, pending_id: str) -> PendingBpmnImport | None:
+    """The user's own pending file, or None when it is unknown, someone else's or older than an hour."""
+    row = db.get(PendingBpmnImport, pending_id)
+    if row is None or row.user_id != user.id or _aware(row.created_at) < utcnow() - PENDING_TTL:
+        return None
+    return row
+
+
+def drop_pending_import(db: Session, row: PendingBpmnImport) -> None:
+    db.delete(row)
     db.commit()
 
 
