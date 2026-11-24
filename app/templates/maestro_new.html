@@ -1,6 +1,8 @@
 {% extends "base.html" %}
 {% block title %}Describe your project{% endblock %}
 {% block content %}
+{% set start = start | default('describe') %}
+{% set is_bpmn = start == 'bpmn' %}
 <h1>Describe your project</h1>
 <p class="lead muted">Tell Maestro what you want to deliver and how the work should flow, from the first description of what to do to production: who writes and validates the specs, where the work is tracked, what Upsun Dispatch builds, who reviews, how it is tested and deployed. Maestro turns it into a process it runs for you, with Upsun Dispatch doing as much of the work as it can.</p>
 {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
@@ -9,16 +11,41 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label>Name <input name="name" value="{{ name }}" required maxlength="128" placeholder="e.g. Legacy app migration, Client support (TMA)"></label>
     {% include "partials/share_switch.html" %}
-    {% set allow_bpmn = true %}
-    {% include "partials/diagram_input.html" %}
 
-    <label>Describe the project
-      <textarea name="description" id="description" class="huge" placeholder="What is the project, and how should it move from the request to production? For example: where requests come from, how they are qualified, who writes and validates the specs, what Upsun Dispatch implements, who reviews and merges, how it is tested (Upsun preview environments) and released, what happens when something is refused or fails, and the tools (GitHub, Linear, Jira, Confluence).
+    <div class="start-from" role="radiogroup" aria-label="Start from">
+      <strong>Start from</strong>
+      <div class="segmented">
+        <label><input type="radio" name="start" value="describe" {% if not is_bpmn %}checked{% endif %}>A description</label>
+        <label><input type="radio" name="start" value="bpmn" {% if is_bpmn %}checked{% endif %}>A BPMN file</label>
+      </div>
+    </div>
 
-You can also paste an image of a process diagram here (Ctrl+V or Cmd+V).">{{ description }}</textarea>
+    <div class="bpmn-file mode-text" data-mode="bpmn"{% if not is_bpmn %} hidden{% endif %}>
+      <label for="bpmn-file"><strong>BPMN file</strong>
+        <input type="file" name="bpmn" id="bpmn-file" accept=".bpmn,application/xml,text/xml"{% if is_bpmn %} required{% endif %}>
+      </label>
+      <small class="help">BPMN 2.0 file from Maestro or any BPMN tool (Camunda, Signavio, Bizagi).</small>
+    </div>
+
+    <div class="mode-text" data-mode="describe"{% if is_bpmn %} hidden{% endif %}>
+      {% set allow_bpmn = true %}
+      {% include "partials/diagram_input.html" %}
+    </div>
+
+    <label for="description">
+      <span class="mode-text" data-mode="describe"{% if is_bpmn %} hidden{% endif %}>Describe the project</span>
+      <span class="mode-text" data-mode="bpmn"{% if not is_bpmn %} hidden{% endif %}>Context</span>
+      <textarea name="description" id="description" class="huge"{% if is_bpmn %} required minlength="40"{% endif %}
+        data-placeholder-describe="What is the project, and how should it move from the request to production? For example: where requests come from, how they are qualified, who writes and validates the specs, what Upsun Dispatch implements, who reviews and merges, how it is tested (Upsun preview environments) and released, what happens when something is refused or fails, and the tools (GitHub, Linear, Jira, Confluence).
+
+You can also paste an image of a process diagram here (Ctrl+V or Cmd+V)."
+        data-placeholder-bpmn="Why this project, who is involved, which tools (GitHub, Linear, Jira), constraints, and anything the diagram does not show. Maestro uses it with the BPMN process."
+        placeholder="{% if is_bpmn %}Why this project, who is involved, which tools (GitHub, Linear, Jira), constraints, and anything the diagram does not show. Maestro uses it with the BPMN process.{% else %}What is the project, and how should it move from the request to production? For example: where requests come from, how they are qualified, who writes and validates the specs, what Upsun Dispatch implements, who reviews and merges, how it is tested (Upsun preview environments) and released, what happens when something is refused or fails, and the tools (GitHub, Linear, Jira, Confluence).
+
+You can also paste an image of a process diagram here (Ctrl+V or Cmd+V).{% endif %}">{{ description }}</textarea>
     </label>
 
-    <small class="help">
+    <small class="help mode-text" data-mode="describe"{% if is_bpmn %} hidden{% endif %}>
       Maestro designs the whole process, step by step, and decides who does what:
       <strong>Upsun Dispatch</strong> takes every step it can (Issue to code, Code review, CVE scan),
       <strong>Maestro</strong> orchestrates the rest (tracker updates, triggers, checks, reports),
@@ -26,7 +53,15 @@ You can also paste an image of a process diagram here (Ctrl+V or Cmd+V).">{{ des
       acceptance environments. Maestro also lists what Dispatch cannot do today and the alternative it chose.
       You review the design, then run the project from Manage, where it is saved.
     </small>
-    <button type="submit" id="describe-submit">{{ icon('design') }}<span id="submit-label">Design the project</span></button>
+    <small class="help mode-text" data-mode="bpmn"{% if not is_bpmn %} hidden{% endif %}>
+      A file exported by Maestro is restored as is, and your context is kept with the project for the next design.
+      For other files, Maestro checks what can run with Upsun Dispatch, asks you how to handle the rest, and designs the project with your context.
+    </small>
+    <button type="submit" id="describe-submit">
+      <span class="mode-text" data-mode="describe"{% if is_bpmn %} hidden{% endif %}>{{ icon('design') }}</span>
+      <span class="mode-text" data-mode="bpmn"{% if not is_bpmn %} hidden{% endif %}>{{ icon('upload') }}</span>
+      <span id="submit-label" data-describe="Design the project" data-bpmn="Import the project">{{ 'Import the project' if is_bpmn else 'Design the project' }}</span>
+    </button>
   </form>
 </article>
 <script src="{{ asset('diagram-input.js') }}"></script>

@@ -86,12 +86,21 @@ def _queue_import(wf: Workflow, result: ImportResult) -> None:
     wf.design_progress = None
 
 
-def create_imported_workflow(db: Session, user: User, result: ImportResult, shared: bool = False) -> Workflow:
-    """A workflow from a BPMN file. Its name is the process name, made unique among the user's workflows."""
+def create_imported_workflow(db: Session, user: User, result: ImportResult, shared: bool = False,
+                             name: str | None = None, context: str | None = None) -> Workflow:
+    """A workflow from a BPMN file.
+
+    With `name`, the project gets that name as is (a taken name raises IntegrityError, rolled back). Without it,
+    the name is the process name, made unique among the user's workflows. With `context`, the description holds
+    the user's context before the imported process, so the review and the designer read both.
+    """
+    process = result.description or "Imported from a BPMN file."
+    description = (f"## Context from the user\n{context}\n\n## Imported BPMN process\n{process}"
+                   if context else process)
     taken = set(db.scalars(select(Workflow.name).where(Workflow.user_id == user.id)))
     for _ in range(20):
-        name = _unique_name(result.name, taken)
-        wf = Workflow(user_id=user.id, name=name, description=result.description or "Imported from a BPMN file.",
+        wf_name = name if name is not None else _unique_name(result.name, taken)
+        wf = Workflow(user_id=user.id, name=wf_name, description=description,
                       content="", design_status="queued", shared=shared)
         if result.kind == "maestro":
             _restore_export(db, wf, result)
@@ -103,13 +112,17 @@ def create_imported_workflow(db: Session, user: User, result: ImportResult, shar
             return wf
         except IntegrityError:  # the same name was taken meanwhile
             db.rollback()
-            taken.add(name)
+            if name is not None:
+                raise
+            taken.add(wf_name)
     raise ManagedAgentsError("Could not find a free name for this project.")
-
 
 def reimport_workflow(db: Session, wf: Workflow, result: ImportResult) -> None:
     """A corrected file replaces the description of the same workflow; the review runs again."""
-    wf.description = result.description or "Imported from a BPMN file."
+    process = result.description or "Imported from a BPMN file."
+    head, sep, _ = (wf.description or "").partition("\n\n## Imported BPMN process\n")
+    # Keep the context typed on the Create page: a corrected file replaces the process only.
+    wf.description = f"{head}{sep}{process}" if sep and head.startswith("## Context from the user\n") else process
     if result.kind == "maestro":
         _restore_export(db, wf, result)
     else:

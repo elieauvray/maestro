@@ -10,7 +10,6 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.anthropic_client import ManagedAgentsError
 from app.db import get_db
 from app.deps import csrf_protect, require_configured
 from app.maestro import service
@@ -55,8 +54,9 @@ def _panel_ctx(request: Request, wf: Workflow, db: Session | None = None, user: 
 
 @router.get("/")
 @router.get("/maestro/new")
-def maestro_new(request: Request, user: User = Depends(require_configured)) -> Response:
-    return render(request, "maestro_new.html", {"name": "", "description": "", "shared": False})
+def maestro_new(request: Request, start: str = "describe", user: User = Depends(require_configured)) -> Response:
+    return render(request, "maestro_new.html", {"name": "", "description": "", "shared": False,
+                                                "start": "bpmn" if start == "bpmn" else "describe"})
 
 
 @router.post("/maestro/new", dependencies=[Depends(csrf_protect)])
@@ -65,11 +65,15 @@ async def maestro_create(
     name: str = Form(...),
     description: str = Form(""),
     shared: str = Form(""),
+    start: str = Form("describe"),
     diagram: UploadFile | None = File(None),
+    bpmn: UploadFile | None = File(None),
     user: User = Depends(require_configured),
     db: Session = Depends(get_db),
 ) -> Response:
     name, description = name.strip(), description.strip()
+    if start == "bpmn":
+        return await _create_from_bpmn(request, name, description, bool(shared), bpmn, user, db)
     error = None
     attached: tuple[str, bytes] | None = None
     if diagram is not None and diagram.filename:
@@ -94,7 +98,37 @@ async def maestro_create(
     if attached and error:
         error += " Attach the diagram again."
     return render(request, "maestro_new.html", {"name": name, "description": description, "error": error,
-                                                "shared": bool(shared)},
+                                                "shared": bool(shared), "start": "describe"},
+                  status_code=400)
+
+
+async def _create_from_bpmn(
+    request: Request, name: str, context: str, shared: bool, bpmn: UploadFile | None, user: User, db: Session
+) -> Response:
+    """Create page, "A BPMN file" mode: the typed name and the required context go with the imported process."""
+    error = None
+    result: ImportResult | None = None
+    if not name or len(name) > 128:
+        error = "The name must be between 1 and 128 characters."
+    elif len(context) < 40:
+        error = "Add some context (at least a few sentences): why this project, who is involved, which tools."
+    else:
+        try:
+            result = await _read_bpmn(bpmn)
+        except BpmnImportError as exc:
+            error = str(exc)
+    if result is not None:
+        try:
+            wf = service.create_imported_workflow(db, user, result, shared=shared, name=name, context=context)
+        except IntegrityError:
+            db.rollback()
+            error = f"You already have a project named {name}."
+        else:
+            flash(request, "BPMN file imported." + (" Your design is restored." if wf.design_status == "ready"
+                                                   else " Maestro is reviewing it."), "info")
+            return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+    return render(request, "maestro_new.html", {"name": name, "description": context, "shared": shared,
+                                                "start": "bpmn", "error": f"{error} Choose the BPMN file again."},
                   status_code=400)
 
 
@@ -110,34 +144,15 @@ def _in_import_review(wf: Workflow) -> bool:
 
 
 @router.get("/maestro/import-bpmn")
-def maestro_import_bpmn_page(request: Request, user: User = Depends(require_configured)) -> Response:
-    return render(request, "maestro_import_bpmn.html", {"shared": False})
+def maestro_import_bpmn_page(user: User = Depends(require_configured)) -> Response:
+    """The separate import page is gone: BPMN import is a mode of the Create page."""
+    return RedirectResponse("/maestro/new?start=bpmn", status_code=303)
 
 
 @router.post("/maestro/import-bpmn", dependencies=[Depends(csrf_protect)])
-async def maestro_import_bpmn(
-    request: Request,
-    shared: str = Form(""),
-    origin: str = Form(""),
-    name: str = Form(""),
-    description: str = Form(""),
-    diagram: UploadFile | None = File(None),
-    user: User = Depends(require_configured),
-    db: Session = Depends(get_db),
-) -> Response:
-    try:
-        result = await _read_bpmn(diagram)
-        wf = service.create_imported_workflow(db, user, result, shared=bool(shared))
-    except (BpmnImportError, ManagedAgentsError) as exc:
-        flash(request, str(exc), "error")
-        # Fixed whitelist: errors go back to the page the form came from, never to a submitted URL.
-        return RedirectResponse("/maestro/import-bpmn" if origin == "import" else "/maestro/new", status_code=303)
-    flash(request, "BPMN file imported." + (" Your design is restored." if wf.design_status == "ready"
-                                           else " Maestro is reviewing it."), "info")
-    if name.strip() or description.strip():
-        flash(request, "The workflow was imported from the BPMN file; the name and description you typed "
-                       "were not used.", "info")
-    return RedirectResponse(f"/workflows/{wf.id}/design", status_code=303)
+def maestro_import_bpmn(request: Request, user: User = Depends(require_configured)) -> Response:
+    flash(request, "Import a BPMN file from the Create page.", "info")
+    return RedirectResponse("/maestro/new?start=bpmn", status_code=303)
 
 
 @router.post("/workflows/{workflow_id}/import-bpmn", dependencies=[Depends(csrf_protect)])
