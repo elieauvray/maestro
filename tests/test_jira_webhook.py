@@ -76,3 +76,13 @@ def test_status_and_label_changes_count(client, fake):
     labels = {**status, "changelog": {"items": [{"field": "labels"}]}}
     assert jira_wake_reason(status) == "Jira issue SUP-3 changed" and jira_wake_reason(labels)
     assert jira_wake_reason({"webhookEvent": "worklog_created", "issue": {"key": "SUP-3"}}) is None
+
+
+def test_jira_project_is_named_by_key_name_or_url():
+    from app.maestro.service import matches_jira_project
+
+    hints = {"SUP", "Support desk", "10042"}
+    assert matches_jira_project(["SUP"], hints) and matches_jira_project(["support desk"], hints)
+    assert matches_jira_project(["https://acme.atlassian.net/jira/software/projects/SUP/boards/3"], hints)
+    assert matches_jira_project(["https://acme.atlassian.net/browse/SUP-12"], hints)
+    assert not matches_jira_project(["OPS"], hints) and not matches_jira_project([], hints)

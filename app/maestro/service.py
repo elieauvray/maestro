@@ -1089,9 +1089,31 @@ def wake_for_linear(db: Session, user: User, project_hints: set[str], why: str,
                  own_activity)
 
 
+def jira_project_values(wf: Workflow) -> list[str]:
+    """The Jira project(s) a Maestro project works on: its settings named like JIRA_PROJECT."""
+    return [str(c.get("value") or "").strip() for c in (wf.design_json or {}).get("config") or []
+            if "JIRA" in str(c.get("key") or "").upper() and "PROJECT" in str(c.get("key") or "").upper()
+            and str(c.get("value") or "").strip()]
+
+
+def _jira_norm(text: str) -> str:
+    """A Jira project key, name or id; from a URL (…/browse/SUP-12, …/projects/SUP/boards/1), its key."""
+    text = text.strip()
+    m = re.search(r"/(?:browse|projects)/([A-Za-z][A-Za-z0-9_]*)", text)
+    if m:
+        text = m.group(1)
+    m = re.match(r"^([A-Za-z][A-Za-z0-9_]*)-\d+$", text)  # an issue key: its project key
+    return (m.group(1) if m else text).lower()
+
+
+def matches_jira_project(values: list[str], hints: set[str]) -> bool:
+    return bool({_jira_norm(v) for v in values} - {""} & ({_jira_norm(h) for h in hints} - {""}))
+
+
 def wake_for_jira(db: Session, user: User, projects: set[str], why: str, own_activity: bool = False) -> list[int]:
-    """Jira: a request was created or changed (status, labels, resolution, comment) in one of these projects."""
-    return _wake(db, user, lambda wf: _mentions_team(wf, projects), why, own_activity)
+    """Jira: a request was created or changed in a Jira project. Only the Maestro projects whose settings name
+    that Jira project are woken: other projects of the site are ignored."""
+    return _wake(db, user, lambda wf: matches_jira_project(jira_project_values(wf), projects), why, own_activity)
 
 
 MAX_FOLLOW_UPS = 3  # in a row: a safety net in case Maestro's own activity was not recognized
